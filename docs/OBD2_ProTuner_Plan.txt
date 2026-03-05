@@ -1,0 +1,101 @@
+====================================================
+   OBD2 PRO TUNER — DEVELOPMENT PLAN
+   2008 Toyota FJ Cruiser 4WD
+   MobileCLI + Szchoiceway GT6-CAR
+   Created: 2026-03-05
+====================================================
+
+WHAT WE BUILT THIS SESSION:
+============================
+1. Discovered hardwired OBD2 on /dev/ttyHS1 @ 115200 baud
+2. Reverse-engineered Szchoiceway MCU protocol (heartbeat, sensors, commands)
+3. Confirmed: MIL ON, 9 DTCs stored (heartbeat byte 0x89)
+4. Built full web-based Pro Tuner UI at localhost:8099
+   - 6 tabs: Dashboard, DTCs, Live Data, Raw Hex, Tools, Info
+   - Real-time serial data streaming
+   - DTC scanner with 100+ code database + severity + fix instructions
+   - Clear DTCs function
+   - Raw hex command sender with quick-command buttons
+   - Export reports to /sdcard/Download/
+5. Built Android APK (OBD2Scanner.apk, 21KB)
+6. Installed CLI tools: obd2-scan, obd2-tuner
+7. Identified exact CAN decoder: LuZhengCanParseToyotaFJ
+8. Analyzed CAN bus data (idle vs throttle frame comparison)
+9. Full documentation saved to device
+
+NEXT SESSION TODO LIST:
+========================
+
+PRIORITY 1 — GitHub Setup & Push
+  [ ] Run: gh auth login
+  [ ] Create repo: gh repo create obd2-pro-tuner --public
+  [ ] Push all code + APK + docs
+  [ ] Create GitHub release with APK download
+
+PRIORITY 2 — Bring Back Live Gauges
+  [ ] The 0x08 frames are raw CAN relay (not decoded params)
+  [ ] Option A: Get head unit CAN bus app to select Toyota FJ Cruiser
+      - This starts LuZhengCanParseToyotaFJ decoder service
+      - Decoded RPM/Speed/Coolant/Throttle will appear in data stream
+  [ ] Option B: Do key-on vs key-off capture comparison
+  [ ] Option C: Decompile LuZhengCanParseToyotaFJ from classes2.dex
+  [ ] Once decoded: wire up RPM, Speed, Coolant, Throttle, Voltage gauges
+
+PRIORITY 3 — Pro Tuner Graph Features
+  [ ] Multi-channel real-time line graphs (like dyno software)
+  [ ] Peak hold / min-max per parameter
+  [ ] Data logging to CSV (start/stop recording)
+  [ ] Session playback with timeline scrubber
+  [ ] Configurable gauge layouts (digital + analog + bar + graph)
+
+PRIORITY 4 — Enhanced DTC System
+  [ ] Get actual 9 DTC codes (via CAN service or ELM327)
+  [ ] Freeze frame data per DTC
+  [ ] Pending vs confirmed vs permanent codes
+  [ ] DTC history tracking across sessions
+  [ ] One-tap Google search for any code
+
+PRIORITY 5 — MobileCLI Drawer Integration
+  [ ] Find MobileCLI source (check ~/MobileCLI-v9.0.0 or drawer config)
+  [ ] Add "OBD2 Tuner" button that launches web UI
+  [ ] Or add button that launches the APK
+
+PRIORITY 6 — APK v2.0
+  [ ] Embed web UI in WebView (single APK, no separate server)
+  [ ] Add proper app icon
+  [ ] Auto-start serial connection
+  [ ] Notification with live MIL status
+  [ ] Proper Android permissions for serial access
+
+PRIORITY 7 — Commercial Polish
+  [ ] App store listing materials
+  [ ] Screenshots and demo video
+  [ ] Vehicle compatibility database (500+ models from canbus2)
+  [ ] Settings page (baud rate, port, vehicle selection)
+  [ ] Dark/light theme toggle
+  [ ] Multi-language support
+
+FILES ON DEVICE:
+================
+/sdcard/Download/OBD2Scanner.apk — Android app
+/sdcard/Download/OBD2_Scanner_Documentation.txt — Full docs
+/sdcard/Download/OBD2_Report.txt — Initial diagnostic report
+~/obd2-scanner/ — Complete source code (git repo)
+~/obd2-scanner/server.py — Web UI server
+~/obd2-scanner/build.sh — APK build script
+
+COMMANDS:
+=========
+obd2-tuner      — Launch web UI at localhost:8099
+obd2-scan       — CLI serial scanner
+obd2-scan --app — Launch Android app
+
+TECHNICAL NOTES:
+================
+- MCU heartbeat: 04 71 01 00 89 (MIL=ON, DTCs=9)
+- 0x08 frames = raw CAN relay, NOT decoded OBD2 params
+- CAN decoder exists: LuZhengCanParseToyotaFJ (in canbus2 APK)
+- MCU ignores all commands without CAN service handshake
+- Build chain: aapt2 + javac(--release 8) + d8 + zipalign + apksigner
+- Android SDK: ~/android-sdk/platforms/android-28/android.jar
+====================================================

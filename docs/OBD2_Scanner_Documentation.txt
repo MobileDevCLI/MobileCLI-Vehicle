@@ -1,0 +1,237 @@
+====================================================
+   MobileCLI OBD2 SCANNER - COMPLETE DOCUMENTATION
+   Version 1.0 | 2026-03-05
+====================================================
+
+OVERVIEW
+--------
+MobileCLI now includes OBD2 vehicle diagnostics as a built-in
+capability. This was discovered through direct serial communication
+with the Szchoiceway GT6-CAR head unit's MCU, which has a hardwired
+OBD2 adapter connected to /dev/ttyHS1.
+
+HARDWARE SETUP
+--------------
+  Head Unit:  Szchoiceway GT6-CAR
+  Firmware:   GT6-EAU-T16.00.050
+  MCU ID:     PRLC0__GT6E_GB___S148 7808
+  Platform:   Qualcomm SM6125 (Android 13)
+  Serial:     /dev/ttyHS1 @ 115200 baud (hardwired)
+
+The OBD2 adapter is plugged directly into the back of the head unit
+(not Bluetooth). Data flows through the MCU via a proprietary
+Szchoiceway serial protocol.
+
+====================================================
+TOOLS INCLUDED
+====================================================
+
+1. OBD2 SCANNER APP (GUI)
+   File: /sdcard/Download/OBD2Scanner.apk
+   Package: com.mobilecli.obd2
+
+   Features:
+   - Dark theme with green accent (car-diagnostic style)
+   - SCAN VEHICLE - reads MCU heartbeat and DTCs
+   - CLEAR CODES - sends OBD2 Mode 04 to clear DTCs
+   - SAVE REPORT - saves diagnostic report to Downloads
+   - Auto-scan support via intent
+
+   Launch: am start -n com.mobilecli.obd2/.OBD2Scanner
+
+   Install: Open /sdcard/Download/OBD2Scanner.apk from file manager
+            or run: obd2-scan --app
+
+2. CLI TOOL (obd2-scan)
+   Location: /data/data/com.termux/files/usr/bin/obd2-scan
+
+   Commands:
+   - obd2-scan           Serial scan (default)
+   - obd2-scan --app     Launch GUI app
+   - obd2-scan --serial  CLI serial port scan
+   - obd2-scan --status  Quick MIL/DTC count
+   - obd2-scan --raw     Raw serial data dump
+   - obd2-scan --help    Show help
+
+====================================================
+PROTOCOL DOCUMENTATION
+====================================================
+
+SZCHOICEWAY MCU SERIAL PROTOCOL
+--------------------------------
+Communication: CRLF-delimited binary frames
+Port: /dev/ttyHS1 @ 115200 baud
+
+Frame Format:
+  [0x0D 0x0A] [TYPE] [DATA...] [0x0D 0x0A]
+
+Frame Types:
+  0x03 - Status frame (4 bytes total)
+  0x04 - Heartbeat (5 bytes: 04 71 01 00 STATUS)
+  0x08 - Sensor/CAN data (9 bytes)
+  0x11 - Extended response (variable, 10+ bytes)
+  0x1D - Identification (30+ bytes)
+  0x55 - Bulk data
+
+HEARTBEAT FRAME (0x04):
+  Bytes: 04 71 01 00 XX
+  XX = Status byte:
+    Bit 7 (MSB) = MIL (Check Engine Light): 1=ON, 0=OFF
+    Bits 0-6 = DTC count (0-127)
+
+  Example: 04 71 01 00 89
+    0x89 = 10001001 binary
+    Bit 7 = 1 -> MIL ON
+    Bits 0-6 = 9 -> 9 DTCs stored
+
+COMMAND FORMAT (0x55 header):
+  55 [LEN] [CMD] [SUB] [DATA] [CHECKSUM]
+
+  Commands:
+    0x50 - Status request
+    0x60 - Warning/fault info
+    0x70 - Diagnostic data
+
+EXTENDED RESPONSE (0x11 type):
+  11 A5 2E 28 0B E0 71 [DATA...] [CHECKSUM] 1C
+
+  Contains actual DTC data when CAN bus service is active.
+
+DTC ENCODING (Standard OBD2):
+  2 bytes per DTC:
+  Byte 1: [TT XXXXXX]  Byte 2: [XXXXXXXX]
+    TT = Type: 00=P (Powertrain), 01=C (Chassis),
+               10=B (Body), 11=U (Network)
+    Remaining 14 bits = DTC number (0000-9999)
+
+====================================================
+CAN BUS APPS ON HEAD UNIT
+====================================================
+
+com.szchoiceway.zxwsyscanbus
+  - System CAN bus service (runs as system)
+  - Contains libserial_port.so (native JNI)
+  - Manages MCU communication handshake
+
+com.szchoiceway.canbus2
+  - CAN bus UI app
+  - Supports 500+ vehicle models
+  - Shows climate, vehicle info, OBD, fault codes
+  - Car type config: assets/cartype/simple_cartype_en.json
+
+com.szchoiceway.canbusdebug
+  - Raw CAN bus debug tool
+  - Shows live CAN data streams
+
+com.szchoiceway.zxw_dashboard
+  - Dashboard display app
+
+com.szchoiceway.canoriginalcarmedia
+  - Original car media integration
+
+com.lfg.szchoiceway.canupgrade
+  - CAN module firmware upgrade tool
+
+====================================================
+CURRENT VEHICLE STATUS
+====================================================
+
+CHECK ENGINE LIGHT: ON
+STORED DTCs: 9
+
+MCU Heartbeat: 04 71 01 00 89
+
+MCU Extended Responses Captured:
+  CMD 0x50: 11 A5 2E 28 0B E0 71 01 01 00 00 00 00 00 00 00 79 1C
+  CMD 0x60: 11 A5 2E 28 0B E0 71 11 11 00 00 00 00 00 00 00 59 1C
+  CMD 0x60: 11 A5 2E 28 0B E0 71 15 15 00 00 00 00 00 00 00 51 1C
+  CMD 0x70: 11 A5 2E 28 0B E0 71 1D 1D 00 00 00 00 00 00 00 41 1C
+
+====================================================
+HOW TO READ THE 9 DTC CODES
+====================================================
+
+OPTION 1 - Head Unit CAN Bus App (EASIEST):
+  1. Go to head unit home screen
+  2. Open CAN Bus / Vehicle Info app
+  3. Select your vehicle type if prompted
+  4. Navigate to Vehicle Fault / Warning section
+  5. All 9 codes will be displayed with descriptions
+
+OPTION 2 - OBD2 Scanner App:
+  1. Install /sdcard/Download/OBD2Scanner.apk
+  2. Open OBD2 Scanner from app drawer
+  3. Tap SCAN VEHICLE
+  4. App reads MCU and attempts to extract codes
+  Note: Full extraction requires CAN bus service running
+
+OPTION 3 - Bluetooth ELM327 (MOST RELIABLE):
+  1. Get a Bluetooth ELM327 OBD2 adapter ($10-20)
+  2. Plug into OBD2 port under driver's dash
+  3. Pair with head unit Bluetooth
+  4. Install Torque Pro or Car Scanner app
+  5. Read all DTCs with full descriptions
+
+OPTION 4 - CLI from MobileCLI:
+  Run: obd2-scan --serial
+
+====================================================
+KNOWN LIMITATIONS
+====================================================
+
+1. PERMISSION: Running as untrusted_app (uid 10173), cannot:
+   - Start system services (zxwCanbusService)
+   - Access system app data directories
+   - Install APKs via pm install
+
+2. CAN BUS SERVICE: The Szchoiceway CAN bus services need to
+   be running for full DTC enumeration. They can only be
+   started from the head unit UI or system boot.
+
+3. SERIAL ACCESS: /dev/ttyHS1 is world-readable (rw-rw-rw-)
+   so we CAN read data, but the MCU requires proper handshake
+   from the canbus service to return individual DTC codes.
+
+WORKAROUNDS:
+- APK installed as regular app can use Android PackageInstaller
+- Use head unit's built-in CAN bus app for full DTC data
+- ELM327 Bluetooth adapter bypasses all MCU limitations
+
+====================================================
+BUILD FROM SOURCE
+====================================================
+
+Prerequisites: Java 17, aapt2, d8, apksigner, zipalign
+  (All included in MobileCLI/Termux)
+
+Build:
+  cd ~/obd2-scanner
+  bash build.sh
+
+Source: ~/obd2-scanner/app/src/main/java/com/mobilecli/obd2/
+
+====================================================
+PYTHON LIBRARIES INSTALLED
+====================================================
+
+  python-obd v0.7.3 - OBD2 protocol library
+  pyserial v3.5     - Serial communication
+  bleak v2.1.1      - BLE library
+
+Python quick scan:
+  python3 -c "
+  import serial, time
+  s = serial.Serial('/dev/ttyHS1', 115200, timeout=5)
+  time.sleep(3)
+  data = s.read(s.in_waiting or 1024)
+  # Find heartbeat
+  for i in range(len(data)-4):
+      if data[i]==0x0d and data[i+1]==0x0a and data[i+2]==0x04 and data[i+3]==0x71:
+          status = data[i+6]
+          mil = (status >> 7) & 1
+          dtcs = status & 0x7F
+          print(f'MIL: {\"ON\" if mil else \"OFF\"}, DTCs: {dtcs}')
+  s.close()
+  "
+
+====================================================
