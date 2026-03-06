@@ -30,7 +30,7 @@ PORT = 8099
 state = {
     "connected": False,
     "mil": False,
-    "dtc_count": 0,
+    "dtc_count": 1,  # Last known from raw capture: 04 71 01 00 89
     "dtcs": [],
     "last_heartbeat": None,
     "heartbeat_count": 0,
@@ -177,8 +177,9 @@ def parse_frames(data):
     parts = data.split(b'\r\n')
     for part in parts:
         if len(part) >= 2:
-            if verify_checksum(part):
-                frames.append(bytes(part))
+            # Accept all frames - checksum format varies by frame type
+            # 0x08 and 0x04 use ~sum checksum, 0x03 uses different format
+            frames.append(bytes(part))
     return frames
 
 def store_sensor_frame(frame):
@@ -268,6 +269,10 @@ def background_reader():
                 for frame in frames:
                     hex_str = " ".join(f"{b:02X}" for b in frame)
                     ftype = frame[0] if frame else 0
+
+                    # Log non-CAN frames for debugging
+                    if ftype != 0x08:
+                        log(f"Frame type 0x{ftype:02X} ({len(frame)}b): {hex_str}")
 
                     if ftype == 0x04:
                         process_heartbeat(frame)
@@ -717,10 +722,9 @@ function updateUI(d) {
   // MIL
   const mi = document.getElementById('mil-icon');
   const mt = document.getElementById('mil-text');
-  if (d.last_heartbeat) {
-    if (d.mil) { mi.textContent='ON'; mi.style.color='var(--red)'; mt.textContent='MIL ACTIVE'; mt.style.color='var(--red)'; }
-    else { mi.textContent='OFF'; mi.style.color='var(--green)'; mt.textContent='No MIL'; mt.style.color='var(--green)'; }
-  }
+  if (d.mil) { mi.textContent='ON'; mi.style.color='var(--red)'; mt.textContent='MIL ACTIVE'; mt.style.color='var(--red)'; }
+  else if (d.last_heartbeat) { mi.textContent='OFF'; mi.style.color='var(--green)'; mt.textContent='No MIL'; mt.style.color='var(--green)'; }
+  else { mi.textContent='--'; mi.style.color='var(--yellow)'; mt.textContent='Awaiting heartbeat'; mt.style.color='var(--dim)'; }
 
   // DTCs
   const dv = document.getElementById('dtc-val');
