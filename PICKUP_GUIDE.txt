@@ -1,0 +1,224 @@
+================================================================================
+  OBD2 PRO TUNER — PICKUP GUIDE FOR FUTURE CLAUDE SESSIONS
+================================================================================
+
+  Vehicle: 2008 Toyota FJ Cruiser 4WD (base model)
+  Head Unit: Szchoiceway GT6-CAR (GT6-EAU-T16.00.050)
+  SoC: Qualcomm SM6125 (Snapdragon 665), Android 13
+  MCU: PRLC0__GT6E_GB___S148 7808
+  GitHub: https://github.com/MobileDevCLI/MobileCLI-Vehicle
+
+================================================================================
+  WHAT'S BEEN DONE (DO NOT REDO)
+================================================================================
+
+1. FULL REVERSE ENGINEERING of head unit MCU serial protocol:
+   - /dev/ttyHS1 @ 115200 baud
+   - Frame format: 0D 0A [LEN] [DATA...LEN bytes]
+   - Command types: 0x71=heartbeat, 0x8E=IMU, 0xA5=CAN, 0xA6=ATA
+   - Checksum: ~(sum of LEN + DATA) & 0xFF
+   - Send: 0D 0A [LEN] [DATA] [~CHK] 00
+
+2. FULL REVERSE ENGINEERING of CAN bus data flow:
+   - EventCenter APK decompiled at ~/tmp/eventcenter_dex/
+   - canbus2 APK decompiled at ~/tmp/smali_out/
+   - Data flow: ttyHS1 → SerialReadThread → EventService → CanbusDataService
+   - LuZheng parser: speed(0x16), RPM(0x50), doors(0x24), AC(0x28)
+
+3. HARDWARE FINDINGS:
+   - Hardwired CAN adapter has ONLY 2 PINS (power/ground) — NO CAN DATA
+   - OBD2 port has CAN-H on pin 6, CAN-L on pin 14 — but adapter doesn't use them
+   - Head unit supports 22 CAN box brands (see list below)
+   - Current config: LuZheng brand (#3), Toyota brand=1, carType=0x22E (FJ)
+
+4. SOFTWARE BUILT:
+   - Web UI v3.0: ~/obd2-scanner/server.py (run: python3 server.py → localhost:8099)
+   - APK v2: ~/obd2-scanner/build/OBD2Scanner.apk (also at /sdcard/Download/)
+     - Has Bluetooth ELM327 support (scan/pair/connect/query PIDs/DTCs)
+     - Source: app/src/main/java/com/mobilecli/obd2/OBD2Scanner.java
+     - BT helper: app/src/main/java/com/mobilecli/obd2/BluetoothOBD2.java
+     - Manifest: app/src/main/AndroidManifest.xml (has BT+location permissions)
+     - Build: bash ~/obd2-scanner/build.sh
+   - CLI: $PREFIX/bin/obd2-scan, $PREFIX/bin/obd2-tuner
+
+5. BLUETOOTH LIMITATIONS FOUND:
+   - NO RFCOMM kernel module — Python socket BT doesn't work
+   - Only Android BluetoothSocket API works (APK approach)
+   - pm install blocked from Termux (uid 10173, no INTERACT_ACROSS_USERS)
+   - app_process doesn't execute user DEX on this device
+   - Head unit BT/WiFi conflict (cheap radio)
+   - termux-api installed — bluetooth-info/paired/scaninfo/connect/enable work
+   - NO active BT discovery/pairing from CLI
+
+================================================================================
+  WHEN NEW OBD2 ADAPTER ARRIVES — WHAT TO DO
+================================================================================
+
+OPTION A: WiFi ELM327 (BEST — EASIEST PATH)
+---------------------------------------------
+WiFi ELM327 adapters create a TCP server, typically at 192.168.0.10:35000.
+Python connects directly — no pairing, no kernel issues, no APK needed.
+
+Steps:
+1. Plug WiFi ELM327 into OBD2 port under dash (left of steering wheel)
+2. Turn ignition ON
+3. Connect head unit WiFi to the ELM327's hotspot (usually "WiFi_OBDII" or similar)
+4. Update server.py to add WiFi ELM327 support:
+
+   import socket
+   elm_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+   elm_sock.connect(('192.168.0.10', 35000))  # or 192.168.1.10:35000
+
+   def elm_cmd(cmd, timeout=3):
+       elm_sock.send((cmd + '\r').encode())
+       time.sleep(timeout)
+       return elm_sock.recv(4096).decode()
+
+   # Initialize:
+   elm_cmd('ATZ', 2)    # Reset
+   elm_cmd('ATE0', 1)   # Echo off
+   elm_cmd('ATL0', 1)   # Linefeed off
+   elm_cmd('ATS0', 1)   # Spaces off
+   elm_cmd('ATSP0', 1)  # Auto protocol
+   elm_cmd('ATST32', 1) # Timeout
+
+   # Read PIDs:
+   rpm_resp = elm_cmd('010C', 2)    # RPM
+   speed_resp = elm_cmd('010D', 2)  # Speed
+   coolant_resp = elm_cmd('0105', 2) # Coolant temp
+   throttle_resp = elm_cmd('0111', 2) # Throttle
+   dtc_resp = elm_cmd('03', 3)      # Read DTCs
+
+5. Integrate into web dashboard at localhost:8099
+
+
+OPTION B: Bluetooth ELM327
+---------------------------------------------
+Steps:
+1. Plug BT ELM327 into OBD2 port, turn ignition ON
+2. Open BT settings: am start -n com.szchoiceway.btsuite/.BTMainActivity
+3. Pair the OBD2 device (usually named "OBD" or "OBDII" or "V-LINK", PIN: 1234)
+4. Check it's paired: termux-bluetooth-paired
+5. Install the APK (user must do from file manager):
+   - Open file manager on head unit
+   - Navigate to /sdcard/Download/OBD2Scanner.apk
+   - Tap to install
+6. Launch: am start -n com.mobilecli.obd2/.OBD2Scanner
+7. Tap SCAN BT → tap the OBD device → tap SCAN OBD2
+
+If APK install doesn't work, rebuild:
+   cd ~/obd2-scanner && bash build.sh
+
+
+OPTION C: Hardwired LuZheng CAN Box (replacement)
+---------------------------------------------
+Must be: LuZheng brand, 16-pin, Toyota compatible
+Buy: Search AliExpress for "LuZheng 16pin canbus decoder Toyota"
+Product: https://www.skyfame.com/luzheng-16pin-car-stereo-wire-harness-power-cable-adapter-decoder-canbus-box-for-lexus-gx470-toyota-prado-land-cruiser-120-lc120-p2494.html
+
+Once installed and wired to OBD2 port:
+- 0xA5 frames should start appearing on /dev/ttyHS1
+- server.py v3.0 already has auto-detection for CAN frames
+- LuZheng parser already decoded in the code
+
+================================================================================
+  OBD2 PID REFERENCE (FOR ELM327)
+================================================================================
+
+Mode 01 (Current Data):
+  0100 — Supported PIDs [01-20]
+  0104 — Engine Load (%)
+  0105 — Coolant Temperature (C)
+  010C — Engine RPM
+  010D — Vehicle Speed (km/h)
+  010F — Intake Air Temperature (C)
+  0111 — Throttle Position (%)
+  012F — Fuel Level (%)
+  0142 — Control Module Voltage (V)
+
+Mode 03: Read DTCs
+Mode 04: Clear DTCs
+Mode 09: Vehicle Info (VIN, ECU name)
+  0902 — VIN
+
+Parsing:
+  RPM = ((A * 256) + B) / 4
+  Speed = A (km/h)
+  Coolant = A - 40 (C)
+  Throttle = A * 100 / 255 (%)
+  Engine Load = A * 100 / 255 (%)
+  Intake Temp = A - 40 (C)
+
+DTCs (Mode 03 response "43"):
+  Each DTC = 2 bytes: [high][low]
+  Prefix: bits 7-6 of high byte: 0=P, 1=C, 2=B, 3=U
+  Code: remaining 14 bits as hex
+
+================================================================================
+  HEAD UNIT CAN BOX BRANDS (all 22 supported)
+================================================================================
+
+Sys_Vehicle_deries value → Brand:
+  1  = Simple (basic)
+  2  = Xinbas
+  3  = LuZheng (CURRENTLY CONFIGURED)
+  4  = Raise/RaiseStar
+  5  = LianHangTong
+  6  = Vios/Hiworld
+  7  = RuiDaWei
+  8  = XinCheng
+  9  = ChangYuanTong
+  10 = OD
+  11 = Ruishengwei
+  12 = TangDu
+  13 = XinFeiYang (XFY)
+  14 = XinChi
+  15 = HaoShouYin
+  16 = KeYiChuang
+  17 = ZhiYin
+  18 = SanWu
+  19 = LuCheng
+  20 = WangYong
+  21 = Binary
+  22 = HongNuo
+
+Brands with Toyota FJ Cruiser parsers:
+  LuZheng (3), Binary (21), KeYiChuang (16), Raise (4),
+  SanWu (18), Simple (1), TangDu (12), Vios (6),
+  XinCheng (8), XinChi (14), XinFeiYang (13)
+
+================================================================================
+  KEY FILE LOCATIONS
+================================================================================
+
+~/obd2-scanner/                          — Project root
+~/obd2-scanner/server.py                 — Web server v3.0 (localhost:8099)
+~/obd2-scanner/build.sh                  — APK build script
+~/obd2-scanner/build/OBD2Scanner.apk     — Built APK
+~/obd2-scanner/app/src/main/             — APK source
+  AndroidManifest.xml                    — Manifest (BT+location perms)
+  java/com/mobilecli/obd2/
+    OBD2Scanner.java                     — Main activity (BT scan UI)
+    BluetoothOBD2.java                   — ELM327 BT helper class
+  res/                                   — Resources
+~/obd2-scanner/debug.keystore            — APK signing key
+~/obd2-scanner/PICKUP_GUIDE.txt          — THIS FILE
+
+/sdcard/Download/OBD2Scanner.apk         — APK for user install
+
+~/tmp/eventcenter_dex/                   — Decompiled EventCenter APK
+~/tmp/smali_out/                         — Decompiled canbus2 APK
+~/tmp/smali_syscanbus/                   — Decompiled zxwsyscanbus APK
+~/tmp/canbusdebug_smali/                 — Decompiled canbusdebug APK
+
+$PREFIX/bin/obd2-scan                    — CLI scan tool
+$PREFIX/bin/obd2-tuner                   — CLI tuner tool
+
+~/.claude/projects/.../memory/obd2_project.md  — Claude memory file
+~/.claude/projects/.../memory/MEMORY.md        — Claude main memory
+
+GitHub: https://github.com/MobileDevCLI/MobileCLI-Vehicle
+
+================================================================================
+  END OF PICKUP GUIDE
+================================================================================

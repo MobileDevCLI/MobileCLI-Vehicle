@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-MobileCLI OBD2 Pro Tuner — Web-based vehicle diagnostics & tuning interface
-Runs on localhost:8099, communicates with /dev/ttyHS1 serial MCU
+MobileCLI OBD2 Pro Tuner v3.0 — Vehicle Diagnostics & MCU Sensor Dashboard
+Runs on localhost:8099, reads /dev/ttyHS1 serial MCU
 
-Architecture:
-  - MCU sends CRLF-delimited binary frames on /dev/ttyHS1 @ 115200 baud
-  - Frame types: 0x03(status), 0x04(heartbeat), 0x08(CAN relay), 0x11(extended)
-  - Heartbeat 0x04: MIL status and DTC count (ACCURATE)
-  - CAN relay 0x08: raw CAN bus data from vehicle (requires CAN service decode)
-  - Checksum: ~(sum of all bytes except last) & 0xFF
+Architecture (reverse-engineered from EventCenter/canbus2):
+  - MCU sends CRLF-delimited binary frames: 0D 0A [LEN] [DATA...LEN bytes]
+  - DATA[0] = command type:
+      0x71 = System Event (heartbeat, status)
+      0x8E = 3D/IMU sensor data (accelerometer/gyro)
+      0xA5 = CAN bus relay (vehicle data — requires CAN adapter)
+      0xA6 = ATA data (auxiliary)
+  - Checksum: ~(sum of LEN + DATA) & 0xFF
+  - Send format: 0D 0A [LEN] [DATA] [~CHK] 00
+
+CAN Adapter Status:
+  - CAN data requires LuZheng/ZhongHang adapter physically connected to OBD2
+  - When connected: 0xA5 frames carry decoded vehicle data (RPM, speed, etc.)
+  - Parsed by LuZhengCanParseToyotaFJ: bydata[1]=0x16→Speed, 0x50→RPM, etc.
 """
 
 import http.server
@@ -17,10 +25,11 @@ import os
 import sys
 import time
 import threading
+import math
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from collections import defaultdict
+from collections import defaultdict, deque
 
 SERIAL_PORT = "/dev/ttyHS1"
 BAUD_RATE = 115200
@@ -29,1180 +38,955 @@ PORT = 8099
 # ── Global State ──
 state = {
     "connected": False,
+    "can_connected": False,
     "mil": False,
-    "dtc_count": 1,  # Last known from raw capture: 04 71 01 00 89
+    "dtc_count": 0,  # Updated from heartbeat 0x71 frames when received
     "dtcs": [],
     "last_heartbeat": None,
     "heartbeat_count": 0,
     "raw_frames": [],
     "scan_log": [],
-    "frame_counts": {"sensor": 0, "heartbeat": 0, "status": 0, "other": 0},
+    "frame_counts": {"imu": 0, "heartbeat": 0, "can": 0, "other": 0},
     "frames_per_sec": 0,
     "mcu_raw_bytes": [],
     "vin": "Not available",
     "vehicle": "2008 Toyota FJ Cruiser",
-    "protocol": "Szchoiceway LuZheng CAN",
-    "canbus_profile": "CARTYPE_TOYOTA_FJ_CRUISER",
+    "protocol": "Szchoiceway MCU Serial",
+    "can_status": "No CAN adapter detected",
     "port": SERIAL_PORT,
     "baud": BAUD_RATE,
     "firmware": "GT6-EAU-T16.00.050",
     "mcu_id": "PRLC0__GT6E_GB___S148 7808",
     "head_unit": "Szchoiceway GT6-CAR",
     "platform": "Qualcomm SM6125 / Android 13",
-    "can_groups": {},
-    "can_signals": {},  # Tracked CAN signal values per B7 group
-    "can_history": [],
-    "data_log": [],     # CSV-style data log entries
-    "logging_active": False,
-    "start_time": time.time(),
+    # IMU sensor data
+    "imu": {"x": 0, "y": 0, "z": 0, "b3": 0, "b5": 0, "counter": 0},
+    "imu_history": [],
+    # CAN vehicle data (populated when CAN adapter connected)
+    "can_data": {
+        "rpm": None, "speed": None, "throttle": None,
+        "coolant_temp": None, "battery_voltage": None,
+        "doors": None, "lights": None, "ac": None
+    },
+    "can_frames": {},
+    # Motion detection from IMU
+    "motion": {"state": "Unknown", "vibration": 0.0, "tilt_x": 0.0, "tilt_y": 0.0},
+    # Data logging
+    "log_data": [],
+    "log_active": False,
+    "log_start": None,
 }
 
+# Circular buffers for graphing
+imu_graph = deque(maxlen=200)
+can_graph = deque(maxlen=200)
+
+# ── MCU Frame Parsing ──
+def verify_checksum(frame_bytes):
+    """Verify MCU frame checksum: ~(sum of all bytes except last) & 0xFF"""
+    if len(frame_bytes) < 3:
+        return False
+    total = sum(frame_bytes[:-1]) & 0xFF
+    expected = (~total) & 0xFF
+    return frame_bytes[-1] == expected
+
+def parse_imu_frame(data):
+    """Parse 0x8E IMU/3D sensor frame.
+    Format: [8E, B2, B3, B4, B5, B6, B7, CHK]
+    B2/B4/B6: high nibble = sensor axes (low nibble always 0)
+    B3/B5: full byte values (stable baseline values)
+    B7: counter/sub-type
+    """
+    if len(data) < 7:
+        return
+    b2 = data[1] & 0xFF  # Axis 1 (high nibble)
+    b3 = data[2] & 0xFF  # Baseline 1
+    b4 = data[3] & 0xFF  # Axis 2 (high nibble)
+    b5 = data[4] & 0xFF  # Baseline 2
+    b6 = data[5] & 0xFF  # Axis 3 (high nibble)
+    b7 = data[6] & 0xFF  # Counter
+
+    # Extract 4-bit axis values from high nibbles
+    x = (b2 >> 4) & 0x0F  # 0-15
+    y = (b4 >> 4) & 0x0F
+    z = (b6 >> 4) & 0x0F
+
+    state["imu"] = {
+        "x": x, "y": y, "z": z,
+        "b3": b3, "b5": b5,
+        "counter": b7,
+        "raw": " ".join(f"{b:02X}" for b in data[:8])
+    }
+
+    # Motion detection from IMU variance
+    now = time.time()
+    imu_graph.append({"t": now, "x": x, "y": y, "z": z, "b3": b3, "b5": b5})
+
+    # Calculate vibration (variance of recent readings)
+    if len(imu_graph) >= 5:
+        recent = list(imu_graph)[-10:]
+        x_vals = [r["x"] for r in recent]
+        y_vals = [r["y"] for r in recent]
+        z_vals = [r["z"] for r in recent]
+        variance = sum(
+            (sum((v - sum(vals)/len(vals))**2 for v in vals) / len(vals))
+            for vals in [x_vals, y_vals, z_vals]
+        )
+        vibration = math.sqrt(variance)
+        if vibration < 0.5:
+            motion_state = "Stationary"
+        elif vibration < 2.0:
+            motion_state = "Idle/Slight Movement"
+        elif vibration < 5.0:
+            motion_state = "Moving"
+        else:
+            motion_state = "Heavy Movement"
+        state["motion"] = {
+            "state": motion_state,
+            "vibration": round(vibration, 2),
+            "tilt_x": round(x * 6.0 - 48, 1),  # Rough degrees estimate
+            "tilt_y": round(y * 6.0 - 48, 1),
+        }
+
+    # Data logging
+    if state["log_active"]:
+        state["log_data"].append({
+            "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "x": x, "y": y, "z": z, "b3": b3, "b5": b5, "counter": b7
+        })
+
+    state["frame_counts"]["imu"] += 1
+
+def parse_heartbeat_frame(data):
+    """Parse 0x71 System Event frame (heartbeat).
+    Format varies, but often: [71, STATUS, B3, ...]
+    """
+    state["last_heartbeat"] = datetime.now().strftime("%H:%M:%S")
+    state["heartbeat_count"] += 1
+    if len(data) >= 2:
+        status = data[1] & 0xFF
+        state["mil"] = bool(status & 0x80)
+        state["dtc_count"] = status & 0x7F
+    state["frame_counts"]["heartbeat"] += 1
+
+def parse_can_frame(data):
+    """Parse 0xA5 CAN bus relay frame.
+    This is the raw CAN data from the LuZheng adapter.
+    It will be further parsed by the canbus2 frame header format (default: 2E2E).
+    """
+    state["can_connected"] = True
+    state["can_status"] = "CAN adapter connected"
+    state["frame_counts"]["can"] += 1
+
+    # Store raw CAN frame
+    hex_str = " ".join(f"{b:02X}" for b in data)
+    state["can_frames"][time.time()] = hex_str
+
+    # Try to decode LuZheng 2E2E format
+    # Header: 2E 2E LEN [bydata...] CHK
+    # We'll look for the inner command format
+    decode_luzheng_can(data)
+
+def decode_luzheng_can(data):
+    """Decode LuZheng CAN protocol for Toyota FJ Cruiser.
+    processCmd routing: bydata[1] = command ID
+    """
+    # The CAN data might be wrapped in 2E2E or direct format
+    # Try to find processCmd-compatible data
+    if len(data) < 4:
+        return
+
+    # Try direct format (bydata starts at data[0] or data[1])
+    for offset in [0, 1]:
+        if offset + 1 >= len(data):
+            continue
+        cmd_id = data[offset + 1] if offset + 1 < len(data) else 0
+
+        if cmd_id == 0x16:  # Speed
+            if offset + 4 < len(data):
+                speed_raw = (data[offset+3] & 0xFF) + (data[offset+4] & 0xFF) * 256
+                speed = speed_raw / 16.0
+                state["can_data"]["speed"] = round(speed, 1)
+                can_graph.append({"t": time.time(), "speed": speed})
+
+        elif cmd_id == 0x50:  # RPM
+            if offset + 4 < len(data):
+                rpm = (data[offset+4] & 0xFF) * 256 + (data[offset+3] & 0xFF)
+                state["can_data"]["rpm"] = rpm
+                can_graph.append({"t": time.time(), "rpm": rpm})
+
+        elif cmd_id == 0x24:  # Doors/Lights
+            state["can_data"]["doors"] = f"0x{data[offset+2]:02X}" if offset+2 < len(data) else None
+
+        elif cmd_id == 0x28:  # AC
+            state["can_data"]["ac"] = f"0x{data[offset+2]:02X}" if offset+2 < len(data) else None
+
+def parse_frames(raw_data):
+    """Parse CRLF-delimited MCU frames from raw serial data."""
+    frames = raw_data.split(b'\r\n')
+    parsed = 0
+    for frame in frames:
+        if len(frame) < 2:
+            continue
+        length = frame[0]
+        data = frame[1:]  # Command type + payload + checksum
+
+        if len(data) < length:
+            continue  # Incomplete frame
+
+        cmd_type = data[0] & 0xFF
+
+        # Store raw frame for display
+        hex_str = " ".join(f"{b:02X}" for b in frame)
+        state["raw_frames"].append({
+            "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "hex": hex_str,
+            "type": {0x71: "SysEvent", 0x8E: "IMU/3D", 0xA5: "CAN", 0xA6: "ATA"}.get(cmd_type, f"0x{cmd_type:02X}"),
+            "len": length
+        })
+        if len(state["raw_frames"]) > 500:
+            state["raw_frames"] = state["raw_frames"][-200:]
+
+        # Dispatch by command type
+        if cmd_type == 0x8E:
+            parse_imu_frame(data)
+        elif cmd_type == 0x71:
+            parse_heartbeat_frame(data)
+        elif cmd_type == 0xA5:
+            parse_can_frame(data)
+        else:
+            state["frame_counts"]["other"] += 1
+
+        parsed += 1
+    return parsed
+
+# ── Serial Reader Thread ──
 serial_fd = None
-serial_lock = threading.Lock()
-running = True
-
-# ── DTC Database ──
-DTC_DB = {
-    "P0010": ("Intake Camshaft Position Actuator Circuit (Bank 1)", "Check wiring to camshaft position actuator.", "Medium"),
-    "P0011": ("Intake Cam Position Timing Over-Advanced (Bank 1)", "Check engine oil level/condition. Replace camshaft position actuator solenoid.", "High"),
-    "P0100": ("MAF Circuit Malfunction", "Clean MAF sensor. Check wiring. Replace MAF if cleaning fails.", "High"),
-    "P0101": ("MAF Circuit Range/Performance", "Clean MAF sensor with MAF cleaner spray. Check for air leaks.", "Medium"),
-    "P0120": ("Throttle Position Sensor Circuit", "Check TPS wiring. Test TPS voltage sweep. Replace TPS.", "High"),
-    "P0128": ("Coolant Thermostat Below Regulating Temp", "Replace thermostat. Check ECT sensor accuracy.", "Medium"),
-    "P0130": ("O2 Sensor Circuit (Bank 1 Sensor 1)", "Test O2 sensor voltage. Check wiring. Replace O2 sensor.", "Medium"),
-    "P0171": ("System Too Lean (Bank 1)", "Check for vacuum/intake leaks. Clean MAF. Check fuel pressure.", "High"),
-    "P0172": ("System Too Rich (Bank 1)", "Check for leaking injectors. Inspect fuel pressure regulator.", "High"),
-    "P0174": ("System Too Lean (Bank 2)", "Check for vacuum leaks on bank 2. Clean MAF.", "High"),
-    "P0175": ("System Too Rich (Bank 2)", "Check injectors bank 2. Inspect fuel pressure.", "High"),
-    "P0300": ("Random/Multiple Cylinder Misfire", "Check spark plugs, coils, fuel injectors. Check compression.", "Critical"),
-    "P0301": ("Cylinder 1 Misfire", "Replace spark plug #1. Swap coil to test. Check injector #1.", "High"),
-    "P0302": ("Cylinder 2 Misfire", "Replace spark plug #2. Swap coil to test.", "High"),
-    "P0303": ("Cylinder 3 Misfire", "Replace spark plug #3. Swap coil to test.", "High"),
-    "P0304": ("Cylinder 4 Misfire", "Replace spark plug #4. Swap coil to test.", "High"),
-    "P0305": ("Cylinder 5 Misfire", "Replace spark plug #5. Swap coil to test.", "High"),
-    "P0306": ("Cylinder 6 Misfire", "Replace spark plug #6. Swap coil to test.", "High"),
-    "P0325": ("Knock Sensor 1 Circuit (Bank 1)", "Check knock sensor wiring. Test sensor.", "Medium"),
-    "P0335": ("Crankshaft Position Sensor A Circuit", "Check CKP sensor and wiring. Replace sensor.", "Critical"),
-    "P0340": ("Camshaft Position Sensor Circuit (Bank 1)", "Check CMP sensor wiring. Test sensor.", "High"),
-    "P0400": ("EGR Flow Malfunction", "Clean EGR valve. Check EGR passages.", "Medium"),
-    "P0420": ("Catalyst Efficiency Below Threshold (Bank 1)", "Check O2 sensors. Replace catalytic converter.", "Medium"),
-    "P0430": ("Catalyst Efficiency Below Threshold (Bank 2)", "Check O2 sensors. Replace cat converter bank 2.", "Medium"),
-    "P0440": ("EVAP System Malfunction", "Check gas cap. Inspect EVAP hoses.", "Low"),
-    "P0442": ("EVAP Small Leak Detected", "Check gas cap seal. Smoke test EVAP system.", "Low"),
-    "P0455": ("EVAP Large Leak Detected", "Check gas cap first. Smoke test system.", "Medium"),
-    "P0500": ("Vehicle Speed Sensor Malfunction", "Check VSS wiring. Test sensor.", "Medium"),
-    "P0505": ("Idle Control System Malfunction", "Clean throttle body and IAC valve.", "Medium"),
-    "P0562": ("System Voltage Low", "Test battery and charging system. Check alternator.", "Medium"),
-    "P0700": ("Transmission Control System Malfunction", "Scan transmission module for specific codes.", "High"),
-    "P0741": ("Torque Converter Clutch Stuck Off", "Replace TCC solenoid. Check wiring.", "High"),
-    "U0001": ("High Speed CAN Communication Bus", "Check CAN bus wiring. Look for shorts.", "Critical"),
-    "U0100": ("Lost Communication with ECM/PCM", "Check ECM power and ground. Inspect CAN wiring.", "Critical"),
-    "U0101": ("Lost Communication with TCM", "Check TCM power/ground. Inspect CAN wiring.", "High"),
-}
-
-# ── Serial Communication ──
 
 def open_serial():
-    global serial_fd, state
+    global serial_fd
     try:
-        os.system(f"stty -F {SERIAL_PORT} {BAUD_RATE} raw -echo 2>/dev/null")
         serial_fd = os.open(SERIAL_PORT, os.O_RDWR | os.O_NONBLOCK)
         state["connected"] = True
-        log("Serial port opened: " + SERIAL_PORT)
+        add_log("Serial port opened: " + SERIAL_PORT)
         return True
     except Exception as e:
         state["connected"] = False
-        log(f"Serial open failed: {e}")
+        add_log(f"Serial open failed: {e}")
         return False
-
-def close_serial():
-    global serial_fd, state
-    if serial_fd is not None:
-        try:
-            os.close(serial_fd)
-        except:
-            pass
-        serial_fd = None
-    state["connected"] = False
-
-def serial_write(data):
-    global serial_fd
-    with serial_lock:
-        if serial_fd is not None:
-            try:
-                os.write(serial_fd, data)
-                return True
-            except:
-                return False
-    return False
-
-def serial_read(size=4096, timeout=0.5):
-    global serial_fd
-    if serial_fd is None:
-        return b""
-    data = bytearray()
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            chunk = os.read(serial_fd, size)
-            if chunk:
-                data.extend(chunk)
-        except BlockingIOError:
-            pass
-        except:
-            break
-        time.sleep(0.02)
-    return bytes(data)
-
-def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    entry = f"[{ts}] {msg}"
-    state["scan_log"].append(entry)
-    if len(state["scan_log"]) > 500:
-        state["scan_log"] = state["scan_log"][-500:]
-
-# ── Frame Parsing ──
-
-def verify_checksum(frame):
-    """Verify frame checksum: ~(sum of all bytes except last) & 0xFF"""
-    if len(frame) < 2:
-        return False
-    s = sum(frame[:-1]) & 0xFF
-    expected = (~s) & 0xFF
-    return frame[-1] == expected
-
-def parse_frames(data):
-    """Parse CRLF-delimited MCU frames"""
-    frames = []
-    parts = data.split(b'\r\n')
-    for part in parts:
-        if len(part) >= 2:
-            # Accept all frames - checksum format varies by frame type
-            # 0x08 and 0x04 use ~sum checksum, 0x03 uses different format
-            frames.append(bytes(part))
-    return frames
-
-def store_sensor_frame(frame):
-    """Store raw 0x08 CAN relay frame with analysis"""
-    if len(frame) < 9 or frame[0] != 0x08 or frame[1] != 0x8E:
-        return
-    state["frame_counts"]["sensor"] += 1
-
-    hex_str = " ".join(f"{b:02X}" for b in frame)
-    state["mcu_raw_bytes"].append({"hex": hex_str, "t": time.time()})
-    if len(state["mcu_raw_bytes"]) > 40:
-        state["mcu_raw_bytes"] = state["mcu_raw_bytes"][-40:]
-
-    # Frame: 08 8E B2 B3 B4 B5 B6 B7 CHK
-    b2, b3, b4, b5, b6, b7 = frame[2], frame[3], frame[4], frame[5], frame[6], frame[7]
-
-    # Track per B7 group (CAN message type identifier)
-    gk = f"0x{b7:02X}"
-    if gk not in state["can_groups"]:
-        state["can_groups"][gk] = {"count": 0, "last": None, "samples": []}
-    g = state["can_groups"][gk]
-    g["count"] += 1
-    g["last"] = time.time()
-    sample = {"b2": b2, "b3": b3, "b4": b4, "b5": b5, "b6": b6, "t": time.time()}
-    g["samples"].append(sample)
-    if len(g["samples"]) > 50:
-        g["samples"] = g["samples"][-50:]
-
-    # Track signal values (raw bytes for display)
-    state["can_signals"] = {
-        "b2": b2, "b3": b3, "b4": b4, "b5": b5, "b6": b6, "b7": b7,
-        "b2h": b2 >> 4, "b4h": b4 >> 4, "b6h": b6 >> 4,
-        "ts": time.time()
-    }
-
-    # History for graphs (one point per 0.5 sec)
-    now = time.time()
-    hist = state["can_history"]
-    if not hist or now - hist[-1]["t"] >= 0.5:
-        hist.append({
-            "t": now,
-            "b3": b3, "b5": b5, "b7": b7,
-            "b2h": b2 >> 4, "b4h": b4 >> 4, "b6h": b6 >> 4,
-        })
-        if len(hist) > 240:
-            state["can_history"] = hist[-240:]
-
-    # Data logging if active
-    if state["logging_active"]:
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        state["data_log"].append(f"{ts},{b2:02X},{b3:02X},{b4:02X},{b5:02X},{b6:02X},{b7:02X}")
-        if len(state["data_log"]) > 10000:
-            state["data_log"] = state["data_log"][-10000:]
-
-def process_heartbeat(frame):
-    """Process type 0x04 heartbeat — ACCURATE data"""
-    if len(frame) >= 5 and frame[0] == 0x04:
-        # Byte 2: MIL bit + DTC count
-        b2 = frame[2]
-        state["mil"] = bool((b2 >> 7) & 1)
-        state["dtc_count"] = b2 & 0x7F
-        state["last_heartbeat"] = datetime.now().strftime("%H:%M:%S")
-        state["heartbeat_count"] += 1
-        state["frame_counts"]["heartbeat"] += 1
-        return True
-    return False
-
-# ── Background Reader ──
 
 def background_reader():
-    global running
+    """Background thread reading serial data continuously."""
+    global serial_fd
     fps_counter = 0
     fps_time = time.time()
-    reconnect_time = 0
 
-    while running:
-        if not state["connected"]:
-            if time.time() - reconnect_time > 5:
-                open_serial()
-                reconnect_time = time.time()
-            time.sleep(1)
-            continue
+    while True:
+        if serial_fd is None:
+            if not open_serial():
+                time.sleep(2)
+                continue
+
         try:
-            data = serial_read(4096, 0.3)
+            data = os.read(serial_fd, 4096)
             if data:
-                frames = parse_frames(data)
-                for frame in frames:
-                    hex_str = " ".join(f"{b:02X}" for b in frame)
-                    ftype = frame[0] if frame else 0
+                count = parse_frames(data)
+                fps_counter += count
 
-                    # Log non-CAN frames for debugging
-                    if ftype != 0x08:
-                        log(f"Frame type 0x{ftype:02X} ({len(frame)}b): {hex_str}")
-
-                    if ftype == 0x04:
-                        process_heartbeat(frame)
-                        state["raw_frames"].append({"type": "HB", "hex": hex_str, "t": time.time()})
-                    elif ftype == 0x08:
-                        store_sensor_frame(frame)
-                        state["raw_frames"].append({"type": "CAN", "hex": hex_str, "t": time.time()})
-                    elif ftype == 0x03:
-                        state["frame_counts"]["status"] += 1
-                        state["raw_frames"].append({"type": "STS", "hex": hex_str, "t": time.time()})
-                    else:
-                        state["frame_counts"]["other"] += 1
-                        state["raw_frames"].append({"type": f"0x{ftype:02X}", "hex": hex_str, "t": time.time()})
-
-                if len(state["raw_frames"]) > 200:
-                    state["raw_frames"] = state["raw_frames"][-200:]
-
-                fps_counter += len(frames)
+                # Update FPS
                 now = time.time()
                 if now - fps_time >= 1.0:
                     state["frames_per_sec"] = fps_counter
                     fps_counter = 0
                     fps_time = now
-            else:
-                time.sleep(0.05)
+        except BlockingIOError:
+            time.sleep(0.05)
+        except OSError:
+            state["connected"] = False
+            serial_fd = None
+            time.sleep(1)
 
-        except Exception as e:
-            log(f"Reader error: {e}")
-            time.sleep(0.5)
+def add_log(msg):
+    entry = {"time": datetime.now().strftime("%H:%M:%S"), "msg": msg}
+    state["scan_log"].append(entry)
+    if len(state["scan_log"]) > 200:
+        state["scan_log"] = state["scan_log"][-100:]
 
-# ── Commands ──
+# ── Web Server ──
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # Suppress access logs
 
-def cmd_scan_dtcs():
-    log("Starting DTC scan...")
-    commands = [
-        ("Status", bytes([0x55, 0x04, 0x50, 0x00, 0x00, 0x01, 0x51])),
-        ("Warning", bytes([0x55, 0x04, 0x60, 0x00, 0x00, 0x01, 0x61])),
-        ("Diag", bytes([0x55, 0x04, 0x70, 0x00, 0x00, 0x01, 0x71])),
-    ]
-    dtcs_found = []
-    for name, cmd in commands:
-        log(f"Sending {name}: {cmd.hex()}")
-        serial_write(cmd)
-        time.sleep(1.0)
-    log(f"MCU reports {state['dtc_count']} DTCs stored. Individual codes require CAN bus service handshake.")
-    log("To read individual DTCs: select Toyota > FJ Cruiser in head unit CAN bus settings")
-    return dtcs_found
+    def do_GET(self):
+        path = urlparse(self.path).path
+        params = parse_qs(urlparse(self.path).query)
 
-def cmd_clear_dtcs():
-    log("Sending Clear DTCs...")
-    cmd = bytes([0x55, 0x03, 0x04, 0x00, 0x01, 0x5D])
-    serial_write(cmd)
-    time.sleep(1.0)
-    log("Clear command sent. Cycle ignition to verify.")
+        if path == "/api/state":
+            self.json_response(get_api_state())
+        elif path == "/api/imu_graph":
+            self.json_response(list(imu_graph))
+        elif path == "/api/can_graph":
+            self.json_response(list(can_graph))
+        elif path == "/api/raw":
+            self.json_response(state["raw_frames"][-100:])
+        elif path == "/api/log":
+            self.json_response(state["scan_log"])
+        elif path == "/api/log_data":
+            self.json_response(state["log_data"][-1000:])
+        elif path == "/api/start_log":
+            state["log_active"] = True
+            state["log_start"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+            state["log_data"] = []
+            self.json_response({"status": "logging started"})
+        elif path == "/api/stop_log":
+            state["log_active"] = False
+            self.json_response({"status": "logging stopped", "records": len(state["log_data"])})
+        elif path == "/api/download_log":
+            self.send_csv_log()
+        else:
+            self.send_dashboard()
 
-def cmd_raw_send(hex_str):
-    try:
-        data = bytes.fromhex(hex_str.replace(" ", ""))
-        serial_write(data)
-        log(f"Sent: {' '.join(f'{b:02X}' for b in data)}")
-        time.sleep(0.5)
-        resp = serial_read(4096, 1.0)
-        if resp:
-            frames = parse_frames(resp)
-            return [" ".join(f"{b:02X}" for b in f) for f in frames]
-        return []
-    except Exception as e:
-        log(f"Send error: {e}")
-        return []
+    def json_response(self, data):
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
-# ── HTML UI ──
+    def send_csv_log(self):
+        lines = ["time,x,y,z,b3,b5,counter"]
+        for r in state["log_data"]:
+            lines.append(f"{r['time']},{r['x']},{r['y']},{r['z']},{r['b3']},{r['b5']},{r['counter']}")
+        body = "\n".join(lines).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv")
+        self.send_header("Content-Disposition", f"attachment; filename=imu_log_{state.get('log_start','data')}.csv")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
 
-HTML_PAGE = r"""<!DOCTYPE html>
+    def send_dashboard(self):
+        body = DASHBOARD_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+def get_api_state():
+    return {
+        "connected": state["connected"],
+        "can_connected": state["can_connected"],
+        "can_status": state["can_status"],
+        "mil": state["mil"],
+        "dtc_count": state["dtc_count"],
+        "heartbeat": state["last_heartbeat"],
+        "heartbeat_count": state["heartbeat_count"],
+        "fps": state["frames_per_sec"],
+        "frame_counts": state["frame_counts"],
+        "imu": state["imu"],
+        "motion": state["motion"],
+        "can_data": state["can_data"],
+        "vehicle": state["vehicle"],
+        "protocol": state["protocol"],
+        "port": state["port"],
+        "baud": state["baud"],
+        "firmware": state["firmware"],
+        "mcu_id": state["mcu_id"],
+        "head_unit": state["head_unit"],
+        "platform": state["platform"],
+        "log_active": state["log_active"],
+        "log_records": len(state["log_data"]),
+    }
+
+# ── Dashboard HTML ──
+DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>OBD2 Pro Tuner</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OBD2 Pro Tuner v3.0</title>
 <style>
-:root {
-    --bg: #08080e;
-    --panel: #10101a;
-    --panel2: #16162a;
-    --border: #1c1c30;
-    --accent: #00ff88;
-    --accent2: #00ccff;
-    --red: #ff3355;
-    --orange: #ff8800;
-    --yellow: #ffcc00;
-    --text: #dde;
-    --dim: #556;
-    --green: #00ff88;
-}
 * { margin:0; padding:0; box-sizing:border-box; }
-body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; }
-
-/* Header */
-.hdr { background: linear-gradient(180deg, #12122a 0%, #0a0a18 100%); border-bottom: 1px solid var(--accent);
-  padding: 8px 12px; display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 100; }
-.hdr h1 { font-size: 16px; color: var(--accent); font-weight: 700; letter-spacing: 1px; }
-.hdr .status { font-size: 11px; color: var(--dim); }
-.hdr .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
-.dot-on { background: var(--green); box-shadow: 0 0 6px var(--green); }
-.dot-off { background: #333; }
-
-/* Tabs */
-.tabs { display: flex; background: var(--panel); border-bottom: 1px solid var(--border); overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.tabs button { background: none; border: none; color: var(--dim); padding: 10px 14px; font-size: 12px; font-weight: 600;
-  cursor: pointer; white-space: nowrap; border-bottom: 2px solid transparent; font-family: inherit; }
-.tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
-.tabs button:hover { color: var(--text); }
-
-/* Tab content */
-.tab-content { display: none; padding: 12px; }
-.tab-content.active { display: block; }
-
-/* Cards */
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
-.card-title { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
-.card-row { display: flex; gap: 10px; flex-wrap: wrap; }
-
-/* Gauges */
-.gauge { flex: 1; min-width: 100px; text-align: center; padding: 8px; background: var(--panel2); border-radius: 6px; border: 1px solid var(--border); }
-.gauge-label { font-size: 10px; color: var(--dim); text-transform: uppercase; }
-.gauge-value { font-size: 28px; font-weight: 700; font-family: 'Courier New', monospace; margin: 4px 0; }
-.gauge-unit { font-size: 10px; color: var(--dim); }
-.gauge-bar { height: 4px; background: #1a1a30; border-radius: 2px; margin-top: 4px; overflow: hidden; }
-.gauge-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
-
-/* Status indicators */
-.ind { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; }
-.ind-ok { background: #0a2a1a; color: var(--green); border: 1px solid #0a3a2a; }
-.ind-warn { background: #2a1a0a; color: var(--orange); border: 1px solid #3a2a0a; }
-.ind-err { background: #2a0a0a; color: var(--red); border: 1px solid #3a0a0a; }
-.ind-info { background: #0a1a2a; color: var(--accent2); border: 1px solid #0a2a3a; }
-
-/* Raw hex display */
-.hex-line { font-family: 'Courier New', monospace; font-size: 11px; padding: 2px 6px; border-bottom: 1px solid #111; }
-.hex-line:nth-child(even) { background: #0c0c14; }
-.hex-type { display: inline-block; width: 32px; font-weight: 700; }
-.hex-type-CAN { color: var(--accent2); }
-.hex-type-HB { color: var(--green); }
-.hex-type-STS { color: var(--yellow); }
-
-/* Scrollable areas */
-.scroll-box { max-height: 300px; overflow-y: auto; background: #0a0a12; border-radius: 4px; border: 1px solid var(--border); }
-.scroll-box-tall { max-height: 500px; }
-
-/* Canvas */
-canvas { width: 100%; background: #0a0a12; border-radius: 4px; border: 1px solid var(--border); }
-
-/* Button */
-.btn { background: var(--panel2); border: 1px solid var(--border); color: var(--text); padding: 8px 16px;
-  border-radius: 4px; cursor: pointer; font-size: 12px; font-family: inherit; }
-.btn:hover { border-color: var(--accent); color: var(--accent); }
-.btn-accent { border-color: var(--accent); color: var(--accent); }
-.btn-red { border-color: var(--red); color: var(--red); }
-.btn-sm { padding: 4px 10px; font-size: 11px; }
-
-/* Grid */
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
-
-/* Info table */
-.info-row { display: flex; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
-.info-label { color: var(--dim); width: 140px; flex-shrink: 0; }
-.info-value { color: var(--text); flex: 1; font-family: 'Courier New', monospace; }
-
-/* Log */
-.log-line { font-family: 'Courier New', monospace; font-size: 11px; padding: 1px 6px; color: #99a; }
-.log-line:nth-child(even) { background: #0c0c14; }
-
-/* MIL icon */
-.mil-icon { font-size: 20px; }
-
-/* Signal analysis grid */
-.sig-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-.sig-cell { background: var(--panel2); padding: 6px 8px; border-radius: 4px; text-align: center; font-family: 'Courier New', monospace; }
-.sig-cell .lbl { font-size: 9px; color: var(--dim); }
-.sig-cell .val { font-size: 18px; font-weight: 700; }
+body { font-family: 'Segoe UI',system-ui,sans-serif; background:#0a0e17; color:#e0e6ed; }
+.header { background:linear-gradient(135deg,#1a1f2e,#0d1117); padding:12px 20px;
+  display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #21262d; }
+.header h1 { font-size:18px; color:#58a6ff; }
+.header .status { display:flex; gap:12px; font-size:12px; }
+.indicator { display:inline-flex; align-items:center; gap:4px; }
+.dot { width:8px; height:8px; border-radius:50%; }
+.dot.green { background:#3fb950; box-shadow:0 0 6px #3fb95088; }
+.dot.red { background:#f85149; box-shadow:0 0 6px #f8514988; }
+.dot.yellow { background:#d29922; box-shadow:0 0 6px #d2992288; }
+.dot.blue { background:#58a6ff; box-shadow:0 0 6px #58a6ff88; }
+.tabs { display:flex; background:#161b22; border-bottom:1px solid #21262d; overflow-x:auto; }
+.tab { padding:10px 16px; cursor:pointer; font-size:13px; white-space:nowrap;
+  color:#8b949e; border-bottom:2px solid transparent; transition:all .2s; }
+.tab:hover { color:#c9d1d9; }
+.tab.active { color:#58a6ff; border-bottom-color:#58a6ff; }
+.content { padding:16px; min-height:calc(100vh - 100px); }
+.panel { display:none; }
+.panel.active { display:block; }
+.grid { display:grid; gap:12px; }
+.grid-2 { grid-template-columns:1fr 1fr; }
+.grid-3 { grid-template-columns:1fr 1fr 1fr; }
+.grid-4 { grid-template-columns:1fr 1fr 1fr 1fr; }
+@media(max-width:768px) { .grid-2,.grid-3,.grid-4 { grid-template-columns:1fr; } }
+.card { background:#161b22; border:1px solid #21262d; border-radius:8px; padding:14px; }
+.card h3 { font-size:12px; color:#8b949e; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }
+.card .value { font-size:28px; font-weight:700; color:#e6edf3; }
+.card .value.small { font-size:18px; }
+.card .unit { font-size:12px; color:#8b949e; margin-left:4px; }
+.card .sub { font-size:11px; color:#6e7681; margin-top:4px; }
+.card.highlight { border-color:#58a6ff44; }
+.card.warn { border-color:#d2992244; }
+.card.danger { border-color:#f8514944; }
+.card.can-active { border-color:#3fb95044; background:#0d1f0d; }
+.badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+.badge.ok { background:#0d3117; color:#3fb950; }
+.badge.warn { background:#3d2b00; color:#d29922; }
+.badge.err { background:#3d0b0b; color:#f85149; }
+.badge.info { background:#0d2744; color:#58a6ff; }
+.raw-box { background:#0d1117; border:1px solid #21262d; border-radius:6px;
+  padding:10px; font-family:'Cascadia Code',monospace; font-size:12px;
+  max-height:400px; overflow-y:auto; line-height:1.6; }
+.raw-line { color:#7ee787; }
+.raw-line .ts { color:#6e7681; }
+.raw-line .type { color:#d2a8ff; font-weight:600; }
+canvas { width:100%; height:200px; background:#0d1117; border:1px solid #21262d; border-radius:6px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; padding:8px; color:#8b949e; border-bottom:1px solid #21262d; font-weight:600; }
+td { padding:6px 8px; border-bottom:1px solid #21262d11; }
+.btn { padding:8px 16px; border:1px solid #30363d; border-radius:6px;
+  background:#21262d; color:#c9d1d9; cursor:pointer; font-size:13px; }
+.btn:hover { background:#30363d; }
+.btn.primary { background:#238636; border-color:#2ea043; color:white; }
+.btn.danger { background:#da3633; border-color:#f85149; color:white; }
+.gauge { position:relative; width:120px; height:120px; margin:0 auto; }
+.motion-viz { text-align:center; padding:20px; }
+.motion-state { font-size:24px; font-weight:700; margin:10px 0; }
+.info-grid { display:grid; grid-template-columns:140px 1fr; gap:4px 12px; font-size:13px; }
+.info-grid .label { color:#8b949e; }
+.info-grid .val { color:#e6edf3; font-family:monospace; }
 </style>
 </head>
 <body>
-<div class="hdr">
-  <h1>OBD2 PRO TUNER</h1>
-  <div style="flex:1"></div>
+
+<div class="header">
+  <h1>OBD2 Pro Tuner v3.0</h1>
   <div class="status">
-    <span class="dot" id="conn-dot"></span>
-    <span id="conn-text">--</span>
-    &nbsp;&nbsp;
-    <span id="fps-text">0 fps</span>
+    <span class="indicator"><span class="dot" id="dot-serial"></span> <span id="lbl-serial">MCU</span></span>
+    <span class="indicator"><span class="dot" id="dot-can"></span> <span id="lbl-can">CAN</span></span>
+    <span id="fps-display" style="color:#6e7681"></span>
   </div>
 </div>
 
-<div class="tabs" id="tab-bar">
-  <button class="active" onclick="showTab('dash')">Dashboard</button>
-  <button onclick="showTab('live')">Live Data</button>
-  <button onclick="showTab('dtc')">DTCs</button>
-  <button onclick="showTab('raw')">Raw Hex</button>
-  <button onclick="showTab('graph')">Graphs</button>
-  <button onclick="showTab('log')">Data Log</button>
-  <button onclick="showTab('tools')">Tools</button>
-  <button onclick="showTab('info')">Vehicle</button>
+<div class="tabs" id="tabs">
+  <div class="tab active" data-tab="dashboard">Dashboard</div>
+  <div class="tab" data-tab="sensors">Sensors</div>
+  <div class="tab" data-tab="vehicle">Vehicle Data</div>
+  <div class="tab" data-tab="raw">Raw Hex</div>
+  <div class="tab" data-tab="graphs">Graphs</div>
+  <div class="tab" data-tab="log">Data Log</div>
+  <div class="tab" data-tab="tools">Tools</div>
+  <div class="tab" data-tab="info">System Info</div>
 </div>
 
-<!-- ═══ DASHBOARD ═══ -->
-<div class="tab-content active" id="tab-dash">
-  <div class="card">
-    <div class="card-title">Engine Status</div>
-    <div class="card-row">
-      <div class="gauge">
-        <div class="gauge-label">Check Engine</div>
-        <div class="gauge-value mil-icon" id="mil-icon">--</div>
-        <div class="gauge-unit" id="mil-text">--</div>
+<div class="content">
+
+<!-- Dashboard -->
+<div class="panel active" id="panel-dashboard">
+  <div class="grid grid-4" style="margin-bottom:12px">
+    <div class="card" id="card-motion">
+      <h3>Motion State</h3>
+      <div class="value small" id="val-motion">--</div>
+      <div class="sub" id="val-vibration">Vibration: --</div>
+    </div>
+    <div class="card" id="card-imu-x">
+      <h3>Accel X</h3>
+      <div class="value" id="val-imu-x">--</div>
+      <div class="sub">Lateral axis</div>
+    </div>
+    <div class="card" id="card-imu-y">
+      <h3>Accel Y</h3>
+      <div class="value" id="val-imu-y">--</div>
+      <div class="sub">Longitudinal axis</div>
+    </div>
+    <div class="card" id="card-imu-z">
+      <h3>Accel Z</h3>
+      <div class="value" id="val-imu-z">--</div>
+      <div class="sub">Vertical axis</div>
+    </div>
+  </div>
+
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>MCU Connection</h3>
+      <div id="dash-connection" style="font-size:13px; line-height:1.8">
+        Loading...
       </div>
-      <div class="gauge">
-        <div class="gauge-label">Fault Codes</div>
-        <div class="gauge-value" id="dtc-val" style="color:var(--accent2)">--</div>
-        <div class="gauge-unit">stored DTCs</div>
-      </div>
-      <div class="gauge">
-        <div class="gauge-label">MCU Link</div>
-        <div class="gauge-value" id="link-icon" style="font-size:20px">--</div>
-        <div class="gauge-unit" id="link-text">--</div>
+    </div>
+    <div class="card" id="card-can-status">
+      <h3>CAN Adapter Status</h3>
+      <div id="dash-can" style="font-size:13px; line-height:1.8">
+        Loading...
       </div>
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-title">CAN Bus Signals (Raw)</div>
-    <div class="sig-grid" id="sig-grid">
-      <div class="sig-cell"><div class="lbl">B2 (HI)</div><div class="val" id="sb2h">--</div></div>
-      <div class="sig-cell"><div class="lbl">B3 (FULL)</div><div class="val" id="sb3">--</div></div>
-      <div class="sig-cell"><div class="lbl">B4 (HI)</div><div class="val" id="sb4h">--</div></div>
-      <div class="sig-cell"><div class="lbl">B5 (FULL)</div><div class="val" id="sb5">--</div></div>
-      <div class="sig-cell"><div class="lbl">B6 (HI)</div><div class="val" id="sb6h">--</div></div>
-      <div class="sig-cell"><div class="lbl">B7 (TYPE)</div><div class="val" id="sb7">--</div></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Signal Waveform</div>
-    <canvas id="dash-canvas" height="120"></canvas>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Connection Info</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <div class="ind" id="ind-conn">--</div>
-      <div class="ind" id="ind-rate">--</div>
-      <div class="ind" id="ind-frames">--</div>
-      <div class="ind" id="ind-uptime">--</div>
+  <div class="card" style="margin-top:12px" id="card-vehicle-data">
+    <h3>Vehicle Data (CAN)</h3>
+    <div id="dash-vehicle-data">
+      <div style="color:#8b949e; padding:10px;">
+        No CAN adapter detected. Vehicle data (RPM, speed, throttle) requires a
+        CAN bus adapter connected to the OBD2 port. The head unit's LuZheng adapter
+        must be wired to the vehicle harness.
+        <br><br>
+        <b>Current data source:</b> MCU 3D/IMU sensor (accelerometer/gyroscope)
+      </div>
     </div>
   </div>
 </div>
 
-<!-- ═══ LIVE DATA ═══ -->
-<div class="tab-content" id="tab-live">
-  <div class="card">
-    <div class="card-title">CAN Message Groups</div>
-    <div class="scroll-box" id="live-groups">Loading...</div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Byte Analysis (All Frames)</div>
-    <div class="sig-grid">
-      <div class="sig-cell"><div class="lbl">B2 Range</div><div class="val" id="lb2r">--</div></div>
-      <div class="sig-cell"><div class="lbl">B3 Range</div><div class="val" id="lb3r">--</div></div>
-      <div class="sig-cell"><div class="lbl">B4 Range</div><div class="val" id="lb4r">--</div></div>
-      <div class="sig-cell"><div class="lbl">B5 Range</div><div class="val" id="lb5r">--</div></div>
-      <div class="sig-cell"><div class="lbl">B6 Range</div><div class="val" id="lb6r">--</div></div>
-      <div class="sig-cell"><div class="lbl">Groups</div><div class="val" id="lgrp">--</div></div>
+<!-- Sensors -->
+<div class="panel" id="panel-sensors">
+  <div class="card" style="margin-bottom:12px">
+    <h3>IMU / 3D Sensor Data (0x8E Frames)</h3>
+    <div class="grid grid-3" style="margin-top:10px">
+      <div>
+        <div style="color:#8b949e; font-size:12px">Axis X (High Nibble B2)</div>
+        <div style="font-size:32px; font-weight:700; color:#f0883e" id="sens-x">--</div>
+      </div>
+      <div>
+        <div style="color:#8b949e; font-size:12px">Axis Y (High Nibble B4)</div>
+        <div style="font-size:32px; font-weight:700; color:#3fb950" id="sens-y">--</div>
+      </div>
+      <div>
+        <div style="color:#8b949e; font-size:12px">Axis Z (High Nibble B6)</div>
+        <div style="font-size:32px; font-weight:700; color:#58a6ff" id="sens-z">--</div>
+      </div>
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-title">Frame Type Distribution</div>
-    <div id="frame-dist"></div>
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>Baseline Values</h3>
+      <table>
+        <tr><th>Parameter</th><th>Value</th><th>Hex</th></tr>
+        <tr><td>B3 (Baseline 1)</td><td id="sens-b3">--</td><td id="sens-b3-hex">--</td></tr>
+        <tr><td>B5 (Baseline 2)</td><td id="sens-b5">--</td><td id="sens-b5-hex">--</td></tr>
+        <tr><td>Counter (B7)</td><td id="sens-ctr">--</td><td id="sens-ctr-hex">--</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Motion Analysis</h3>
+      <div class="motion-viz">
+        <div class="motion-state" id="motion-state">--</div>
+        <div style="color:#8b949e; font-size:13px">
+          Vibration: <span id="motion-vib">--</span><br>
+          Tilt X: <span id="motion-tx">--</span>&deg; &nbsp;
+          Tilt Y: <span id="motion-ty">--</span>&deg;
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Raw Frame (Last)</h3>
+    <div id="sens-raw" style="font-family:monospace; font-size:14px; color:#7ee787; padding:8px">--</div>
   </div>
 </div>
 
-<!-- ═══ DTCs ═══ -->
-<div class="tab-content" id="tab-dtc">
-  <div class="card">
-    <div class="card-title">Diagnostic Trouble Codes</div>
-    <div style="display:flex;gap:8px;margin-bottom:10px">
-      <button class="btn btn-accent" onclick="scanDTCs()">Scan DTCs</button>
-      <button class="btn btn-red" onclick="clearDTCs()">Clear DTCs</button>
+<!-- Vehicle Data -->
+<div class="panel" id="panel-vehicle">
+  <div id="vehicle-can-active" style="display:none">
+    <div class="grid grid-3" style="margin-bottom:12px">
+      <div class="card can-active">
+        <h3>RPM</h3>
+        <div class="value" id="veh-rpm">--</div>
+      </div>
+      <div class="card can-active">
+        <h3>Speed</h3>
+        <div class="value" id="veh-speed">--<span class="unit">km/h</span></div>
+      </div>
+      <div class="card can-active">
+        <h3>Throttle</h3>
+        <div class="value" id="veh-throttle">--<span class="unit">%</span></div>
+      </div>
     </div>
-    <div id="dtc-status"></div>
-    <div id="dtc-list"></div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">DTC Notes</div>
-    <div style="font-size:12px;color:var(--dim);line-height:1.6">
-      MCU heartbeat confirms <strong id="dtc-note-count">0</strong> stored DTCs.<br>
-      Individual DTC codes require the CAN bus service to be active.<br>
-      To activate: go to head unit Settings > CAN Bus > Toyota > FJ Cruiser.<br>
-      Once activated, the head unit's CAN parser (LuZhengCanParseToyotaFJ) will decode all parameters.
-    </div>
-  </div>
-</div>
-
-<!-- ═══ RAW HEX ═══ -->
-<div class="tab-content" id="tab-raw">
-  <div class="card">
-    <div class="card-title">Raw Serial Frames (Live)</div>
-    <div style="margin-bottom:8px;display:flex;gap:8px">
-      <button class="btn btn-sm" id="raw-pause-btn" onclick="toggleRawPause()">Pause</button>
-      <button class="btn btn-sm" onclick="clearRaw()">Clear</button>
-      <span style="font-size:11px;color:var(--dim);padding-top:6px" id="raw-count">0 frames</span>
-    </div>
-    <div class="scroll-box scroll-box-tall" id="raw-hex">Loading...</div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Frame Format Reference</div>
-    <div style="font-size:11px;color:var(--dim);line-height:1.6;font-family:'Courier New',monospace">
-      Delimiter: 0D 0A (CRLF)<br>
-      Heartbeat: 04 71 [STATUS] [B3] [CHK]<br>
-      &nbsp; STATUS bit7=MIL, bits0-6=DTC count<br>
-      CAN Relay: 08 8E [B2] [B3] [B4] [B5] [B6] [B7] [CHK]<br>
-      &nbsp; B2,B4,B6: data in HIGH nibble only (low=0)<br>
-      &nbsp; B3,B5: full byte values<br>
-      &nbsp; B7: CAN message type identifier<br>
-      Checksum: ~(sum of all bytes except last) & 0xFF
+    <div class="grid grid-2">
+      <div class="card can-active">
+        <h3>Doors / Lights</h3>
+        <div id="veh-doors" style="font-size:14px">--</div>
+      </div>
+      <div class="card can-active">
+        <h3>AC / Climate</h3>
+        <div id="veh-ac" style="font-size:14px">--</div>
+      </div>
     </div>
   </div>
-</div>
-
-<!-- ═══ GRAPHS ═══ -->
-<div class="tab-content" id="tab-graph">
-  <div class="card">
-    <div class="card-title">B3 Signal (Full Byte) — Time Series</div>
-    <canvas id="graph-b3" height="150"></canvas>
-  </div>
-  <div class="card">
-    <div class="card-title">B5 Signal (Full Byte) — Time Series</div>
-    <canvas id="graph-b5" height="150"></canvas>
-  </div>
-  <div class="card">
-    <div class="card-title">High Nibbles (B2h, B4h, B6h) — Overlay</div>
-    <canvas id="graph-nibbles" height="150"></canvas>
-  </div>
-  <div class="card">
-    <div class="card-title">B7 Message Type — Distribution</div>
-    <canvas id="graph-b7" height="100"></canvas>
-  </div>
-</div>
-
-<!-- ═══ DATA LOG ═══ -->
-<div class="tab-content" id="tab-log">
-  <div class="card">
-    <div class="card-title">Data Logging</div>
-    <div style="display:flex;gap:8px;margin-bottom:10px">
-      <button class="btn" id="log-toggle-btn" onclick="toggleLogging()">Start Logging</button>
-      <button class="btn btn-sm" onclick="downloadLog()">Download CSV</button>
-      <button class="btn btn-sm btn-red" onclick="clearLog()">Clear</button>
-    </div>
-    <div id="log-status" style="font-size:12px;color:var(--dim);margin-bottom:8px">Logging: OFF</div>
-    <div class="scroll-box scroll-box-tall" id="log-data" style="font-family:'Courier New',monospace;font-size:11px">
-      Timestamp,B2,B3,B4,B5,B6,B7
+  <div id="vehicle-no-can" class="card">
+    <h3>CAN Adapter Required</h3>
+    <div style="padding:20px; color:#8b949e; line-height:1.8">
+      <p style="font-size:16px; color:#d29922; margin-bottom:12px">
+        No CAN bus adapter detected on MCU serial port
+      </p>
+      <p>To get live vehicle data (RPM, Speed, Throttle, Temperature, Doors, AC), the
+      head unit needs a CAN bus adapter module connected:</p>
+      <ul style="margin:12px 0 12px 20px">
+        <li><b>LuZheng CAN Adapter</b> — Connects to vehicle OBD2 harness</li>
+        <li><b>ZhongHang TY Adapter</b> — Alternative CAN protocol</li>
+        <li><b>Wiring:</b> OBD2 connector &#8594; CAN adapter &#8594; Head unit MCU</li>
+      </ul>
+      <p>When a CAN adapter is connected, this page will automatically display decoded
+      vehicle parameters using the <b>LuZhengCanParseToyotaFJ</b> protocol parser
+      (Car Type 0x22E = Toyota FJ Cruiser).</p>
+      <hr style="border-color:#21262d; margin:16px 0">
+      <p style="font-size:12px; color:#6e7681">
+        <b>Technical:</b> MCU command 0xA5 = CAN relay data. Currently only receiving
+        0x8E (IMU/3D sensor). The MCU's CAN transceiver is not receiving vehicle CAN frames.
+        Checked: Sys_Vehicle_deries=3 (LuZheng), Sys_CarType=558 (0x22E, FJ Cruiser).
+      </p>
     </div>
   </div>
 </div>
 
-<!-- ═══ TOOLS ═══ -->
-<div class="tab-content" id="tab-tools">
+<!-- Raw Hex -->
+<div class="panel" id="panel-raw">
   <div class="card">
-    <div class="card-title">Send Raw Command</div>
-    <div style="display:flex;gap:8px;margin-bottom:8px">
-      <input type="text" id="raw-cmd" placeholder="55 04 50 00 00 01 51" style="flex:1;background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:4px;font-family:'Courier New',monospace;font-size:12px">
-      <button class="btn btn-accent" onclick="sendRawCmd()">Send</button>
+    <h3>Live Frame Stream</h3>
+    <div style="margin-bottom:8px">
+      <span class="badge info" id="raw-count">0 frames</span>
+      <span class="badge" id="raw-imu" style="background:#2d1f00;color:#f0883e">IMU: 0</span>
+      <span class="badge" id="raw-hb" style="background:#0d2744;color:#58a6ff">Heartbeat: 0</span>
+      <span class="badge" id="raw-can" style="background:#0d3117;color:#3fb950">CAN: 0</span>
     </div>
-    <div class="scroll-box" id="cmd-response" style="min-height:60px"></div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Quick Commands</div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">
-      <button class="btn btn-sm" onclick="sendQuick('55 04 50 00 00 01 51')">Status 0x50</button>
-      <button class="btn btn-sm" onclick="sendQuick('55 04 60 00 00 01 61')">Warning 0x60</button>
-      <button class="btn btn-sm" onclick="sendQuick('55 04 70 00 00 01 71')">Diag 0x70</button>
-      <button class="btn btn-sm" onclick="sendQuick('55 04 80 00 00 01 81')">VIN 0x80</button>
-      <button class="btn btn-sm" onclick="sendQuick('55 03 01 00 01 59')">Ping MCU</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">System Log</div>
-    <div class="scroll-box scroll-box-tall" id="sys-log"></div>
+    <div class="raw-box" id="raw-box"></div>
   </div>
 </div>
 
-<!-- ═══ VEHICLE INFO ═══ -->
-<div class="tab-content" id="tab-info">
-  <div class="card">
-    <div class="card-title">Vehicle Information</div>
-    <div id="vehicle-info"></div>
+<!-- Graphs -->
+<div class="panel" id="panel-graphs">
+  <div class="card" style="margin-bottom:12px">
+    <h3>IMU Sensor Waveform</h3>
+    <canvas id="imu-canvas" height="200"></canvas>
   </div>
   <div class="card">
-    <div class="card-title">CAN Bus Architecture</div>
-    <div style="font-size:12px;color:var(--dim);line-height:1.8">
-      <div class="info-row"><div class="info-label">CAN Adapter</div><div class="info-value">LuZheng (Szchoiceway)</div></div>
-      <div class="info-row"><div class="info-label">Parser Class</div><div class="info-value">LuZhengCanParseToyotaFJ</div></div>
-      <div class="info-row"><div class="info-label">Serial Protocol</div><div class="info-value">CRLF-delimited binary, 115200 baud</div></div>
-      <div class="info-row"><div class="info-label">CAN Frame Format</div><div class="info-value">2E 2E LEN [CMD_ID] [DATA...] CHK</div></div>
-      <div class="info-row"><div class="info-label">MCU Frame Format</div><div class="info-value">0D 0A [TYPE] [DATA...] [CHK]</div></div>
-      <div class="info-row"><div class="info-label">Speed Formula</div><div class="info-value">((B3&0xFF)+(B4&0xFF)*256)/16</div></div>
-      <div class="info-row"><div class="info-label">RPM Formula</div><div class="info-value">B4(high) + B3(low) from cmd 0x50</div></div>
-      <div class="info-row"><div class="info-label">CAN Service</div><div class="info-value" id="can-svc-status">Requires activation</div></div>
+    <h3>Baseline Values (B3/B5)</h3>
+    <canvas id="baseline-canvas" height="200"></canvas>
+  </div>
+</div>
+
+<!-- Data Log -->
+<div class="panel" id="panel-log">
+  <div class="card">
+    <h3>Data Logger</h3>
+    <div style="margin-bottom:12px; display:flex; gap:8px; align-items:center">
+      <button class="btn primary" id="btn-log-start" onclick="startLog()">Start Recording</button>
+      <button class="btn danger" id="btn-log-stop" onclick="stopLog()" style="display:none">Stop Recording</button>
+      <button class="btn" onclick="downloadLog()">Download CSV</button>
+      <span id="log-status" style="color:#8b949e; font-size:13px"></span>
+    </div>
+    <div class="raw-box" id="log-box" style="max-height:300px">No data recorded yet.</div>
+  </div>
+</div>
+
+<!-- Tools -->
+<div class="panel" id="panel-tools">
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>MCU Protocol Info</h3>
+      <div style="font-size:13px; color:#8b949e; line-height:1.8">
+        <b>Frame Format:</b> 0D 0A [LEN] [CMD DATA...] [~CHK] 00<br>
+        <b>Read Format:</b> 0D 0A [LEN] [CMD DATA...CHK]<br>
+        <b>Command Types:</b><br>
+        &nbsp; 0x71 = System Event (heartbeat)<br>
+        &nbsp; 0x8E = 3D/IMU sensor data<br>
+        &nbsp; 0xA5 = CAN bus relay (vehicle data)<br>
+        &nbsp; 0xA6 = ATA auxiliary data<br>
+        <b>CAN Decode:</b> LuZheng 2E2E header format<br>
+        <b>Car Type:</b> 0x22E = Toyota FJ Cruiser
+      </div>
+    </div>
+    <div class="card">
+      <h3>Diagnostic Commands</h3>
+      <div style="font-size:13px; color:#8b949e; line-height:1.8">
+        <p>Available when CAN adapter is connected:</p>
+        <table>
+          <tr><td style="color:#d2a8ff">0x16</td><td>Vehicle Speed</td></tr>
+          <tr><td style="color:#d2a8ff">0x50</td><td>Engine RPM</td></tr>
+          <tr><td style="color:#d2a8ff">0x24</td><td>Doors / Lights</td></tr>
+          <tr><td style="color:#d2a8ff">0x28</td><td>AC / Climate</td></tr>
+          <tr><td style="color:#d2a8ff">0x1D</td><td>Radar (Front)</td></tr>
+          <tr><td style="color:#d2a8ff">0x1E</td><td>Radar (Rear)</td></tr>
+          <tr><td style="color:#d2a8ff">0x29</td><td>Wheel Status</td></tr>
+          <tr><td style="color:#d2a8ff">0x30-32</td><td>CAN Version</td></tr>
+        </table>
+      </div>
     </div>
   </div>
-  <div class="card">
-    <div class="card-title">About</div>
-    <div style="font-size:12px;color:var(--dim);line-height:1.6">
-      MobileCLI OBD2 Pro Tuner v2.0<br>
-      Built with MobileCLI on Android<br>
-      github.com/MobileDevCLI/MobileCLI-Vehicle
+</div>
+
+<!-- System Info -->
+<div class="panel" id="panel-info">
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>Vehicle</h3>
+      <div class="info-grid" id="info-vehicle"></div>
+    </div>
+    <div class="card">
+      <h3>Head Unit</h3>
+      <div class="info-grid" id="info-hu"></div>
     </div>
   </div>
+  <div class="card" style="margin-top:12px">
+    <h3>Connection Status</h3>
+    <div class="info-grid" id="info-conn"></div>
+  </div>
+</div>
+
 </div>
 
 <script>
-let rawPaused = false;
-let updateTimer = null;
+let activeTab = 'dashboard';
 
-function showTab(id) {
-  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.tabs button').forEach(el => el.classList.remove('active'));
-  document.getElementById('tab-'+id).classList.add('active');
-  const btns = document.querySelectorAll('.tabs button');
-  const tabs = ['dash','live','dtc','raw','graph','log','tools','info'];
-  const idx = tabs.indexOf(id);
-  if (idx >= 0 && btns[idx]) btns[idx].classList.add('active');
+// Tab switching
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    activeTab = tab.dataset.tab;
+    document.getElementById('panel-' + activeTab).classList.add('active');
+  });
+});
+
+// API polling
+async function poll() {
+  try {
+    const res = await fetch('/api/state');
+    const d = await res.json();
+    updateDashboard(d);
+    if (activeTab === 'raw') updateRaw();
+    if (activeTab === 'graphs') updateGraphs();
+    if (activeTab === 'log') updateLogPanel();
+  } catch(e) {}
+  setTimeout(poll, 500);
 }
 
-function updateUI(d) {
-  // Connection
-  const dot = document.getElementById('conn-dot');
-  const ct = document.getElementById('conn-text');
-  if (d.connected) { dot.className='dot dot-on'; ct.textContent='CONNECTED'; }
-  else { dot.className='dot dot-off'; ct.textContent='DISCONNECTED'; }
-  document.getElementById('fps-text').textContent = d.frames_per_sec + ' fps';
+function updateDashboard(d) {
+  // Status indicators
+  const dotSerial = document.getElementById('dot-serial');
+  const dotCan = document.getElementById('dot-can');
+  dotSerial.className = 'dot ' + (d.connected ? 'green' : 'red');
+  dotCan.className = 'dot ' + (d.can_connected ? 'green' : 'yellow');
+  document.getElementById('lbl-serial').textContent = d.connected ? 'MCU Connected' : 'MCU Disconnected';
+  document.getElementById('lbl-can').textContent = d.can_connected ? 'CAN Active' : 'No CAN';
+  document.getElementById('fps-display').textContent = d.fps + ' fps';
 
-  // MIL
-  const mi = document.getElementById('mil-icon');
-  const mt = document.getElementById('mil-text');
-  if (d.mil) { mi.textContent='ON'; mi.style.color='var(--red)'; mt.textContent='MIL ACTIVE'; mt.style.color='var(--red)'; }
-  else if (d.last_heartbeat) { mi.textContent='OFF'; mi.style.color='var(--green)'; mt.textContent='No MIL'; mt.style.color='var(--green)'; }
-  else { mi.textContent='--'; mi.style.color='var(--yellow)'; mt.textContent='Awaiting heartbeat'; mt.style.color='var(--dim)'; }
+  // Dashboard cards
+  const imu = d.imu || {};
+  document.getElementById('val-imu-x').textContent = imu.x !== undefined ? imu.x : '--';
+  document.getElementById('val-imu-y').textContent = imu.y !== undefined ? imu.y : '--';
+  document.getElementById('val-imu-z').textContent = imu.z !== undefined ? imu.z : '--';
 
-  // DTCs
-  const dv = document.getElementById('dtc-val');
-  dv.textContent = d.dtc_count;
-  dv.style.color = d.dtc_count > 0 ? 'var(--red)' : 'var(--green)';
-  document.getElementById('dtc-note-count').textContent = d.dtc_count;
+  const motion = d.motion || {};
+  document.getElementById('val-motion').textContent = motion.state || '--';
+  document.getElementById('val-vibration').textContent = 'Vibration: ' + (motion.vibration || 0);
 
-  // Link
-  const li = document.getElementById('link-icon');
-  const lt = document.getElementById('link-text');
-  if (d.connected && d.last_heartbeat) {
-    li.textContent='LIVE'; li.style.color='var(--green)';
-    lt.textContent='HB: ' + d.last_heartbeat;
-  } else if (d.connected) {
-    li.textContent='WAIT'; li.style.color='var(--yellow)';
-    lt.textContent='Waiting for heartbeat';
+  const cardMotion = document.getElementById('card-motion');
+  if (motion.state === 'Stationary') cardMotion.className = 'card highlight';
+  else if (motion.state === 'Moving' || motion.state === 'Heavy Movement') cardMotion.className = 'card warn';
+  else cardMotion.className = 'card';
+
+  // Connection info
+  document.getElementById('dash-connection').innerHTML = `
+    <span class="indicator"><span class="dot ${d.connected?'green':'red'}"></span> Serial: ${d.port}</span><br>
+    Baud: ${d.baud} | Frames: ${d.frame_counts.imu + d.frame_counts.heartbeat + d.frame_counts.can + d.frame_counts.other}<br>
+    IMU: ${d.frame_counts.imu} | Heartbeat: ${d.frame_counts.heartbeat} | CAN: ${d.frame_counts.can}<br>
+    Last Heartbeat: ${d.heartbeat || 'None yet'} (${d.heartbeat_count} total)
+    ${d.mil ? '<br><span class="badge err">MIL ON</span>' : ''}
+    ${d.dtc_count > 0 ? '<br>DTCs: ' + d.dtc_count : ''}
+  `;
+
+  document.getElementById('dash-can').innerHTML = `
+    <span class="badge ${d.can_connected ? 'ok' : 'warn'}">${d.can_status}</span><br><br>
+    ${d.can_connected ? 'Receiving CAN frames from vehicle' :
+      'MCU serial shows only IMU/3D data (0x8E frames).<br>' +
+      'No CAN relay frames (0xA5) detected.<br><br>' +
+      'The LuZheng CAN adapter may not be wired to the vehicle OBD2 port.'}
+  `;
+
+  // Vehicle data panel
+  if (d.can_connected) {
+    document.getElementById('vehicle-can-active').style.display = 'block';
+    document.getElementById('vehicle-no-can').style.display = 'none';
+    const cd = d.can_data;
+    document.getElementById('veh-rpm').textContent = cd.rpm !== null ? cd.rpm : '--';
+    document.getElementById('veh-speed').innerHTML = (cd.speed !== null ? cd.speed : '--') + '<span class="unit">km/h</span>';
+    document.getElementById('veh-doors').textContent = cd.doors || '--';
+    document.getElementById('veh-ac').textContent = cd.ac || '--';
   } else {
-    li.textContent='OFF'; li.style.color='var(--red)';
-    lt.textContent='No connection';
+    document.getElementById('vehicle-can-active').style.display = 'none';
+    document.getElementById('vehicle-no-can').style.display = 'block';
   }
 
-  // CAN Signals
-  const sig = d.can_signals || {};
-  if (sig.ts) {
-    document.getElementById('sb2h').textContent = sig.b2h !== undefined ? sig.b2h : '--';
-    document.getElementById('sb3').textContent = sig.b3 !== undefined ? '0x'+(sig.b3).toString(16).toUpperCase().padStart(2,'0') : '--';
-    document.getElementById('sb4h').textContent = sig.b4h !== undefined ? sig.b4h : '--';
-    document.getElementById('sb5').textContent = sig.b5 !== undefined ? '0x'+(sig.b5).toString(16).toUpperCase().padStart(2,'0') : '--';
-    document.getElementById('sb6h').textContent = sig.b6h !== undefined ? sig.b6h : '--';
-    document.getElementById('sb7').textContent = sig.b7 !== undefined ? '0x'+(sig.b7).toString(16).toUpperCase().padStart(2,'0') : '--';
+  // Sensor panel
+  if (activeTab === 'sensors') {
+    document.getElementById('sens-x').textContent = imu.x !== undefined ? imu.x : '--';
+    document.getElementById('sens-y').textContent = imu.y !== undefined ? imu.y : '--';
+    document.getElementById('sens-z').textContent = imu.z !== undefined ? imu.z : '--';
+    document.getElementById('sens-b3').textContent = imu.b3 || '--';
+    document.getElementById('sens-b3-hex').textContent = imu.b3 !== undefined ? '0x' + imu.b3.toString(16).toUpperCase().padStart(2,'0') : '--';
+    document.getElementById('sens-b5').textContent = imu.b5 || '--';
+    document.getElementById('sens-b5-hex').textContent = imu.b5 !== undefined ? '0x' + imu.b5.toString(16).toUpperCase().padStart(2,'0') : '--';
+    document.getElementById('sens-ctr').textContent = imu.counter !== undefined ? imu.counter : '--';
+    document.getElementById('sens-ctr-hex').textContent = imu.counter !== undefined ? '0x' + imu.counter.toString(16).toUpperCase().padStart(2,'0') : '--';
+    document.getElementById('sens-raw').textContent = imu.raw || '--';
+    document.getElementById('motion-state').textContent = motion.state || '--';
+    document.getElementById('motion-vib').textContent = motion.vibration || '0';
+    document.getElementById('motion-tx').textContent = motion.tilt_x || '0';
+    document.getElementById('motion-ty').textContent = motion.tilt_y || '0';
   }
 
-  // Connection indicators
-  const ic = document.getElementById('ind-conn');
-  ic.className = 'ind ' + (d.connected ? 'ind-ok' : 'ind-err');
-  ic.textContent = d.connected ? 'Serial OK' : 'No Serial';
-  const ir = document.getElementById('ind-rate');
-  ir.className = 'ind ind-info';
-  ir.textContent = d.frames_per_sec + ' fps';
-  const ifr = document.getElementById('ind-frames');
-  ifr.className = 'ind ind-info';
-  ifr.textContent = (d.frame_counts.sensor + d.frame_counts.heartbeat) + ' total';
-  const iu = document.getElementById('ind-uptime');
-  iu.className = 'ind ind-info';
-  const up = Math.floor((Date.now()/1000) - d.start_time);
-  const um = Math.floor(up/60), us = up%60;
-  iu.textContent = um + 'm ' + us + 's';
+  // System info
+  if (activeTab === 'info') {
+    document.getElementById('info-vehicle').innerHTML = infoRow('Vehicle', d.vehicle) +
+      infoRow('VIN', 'Not available') +
+      infoRow('CAN Profile', d.can_connected ? 'LuZheng Toyota FJ' : 'Not active') +
+      infoRow('Car Type ID', '0x22E (558)');
+    document.getElementById('info-hu').innerHTML = infoRow('Model', d.head_unit) +
+      infoRow('Firmware', d.firmware) +
+      infoRow('MCU ID', d.mcu_id) +
+      infoRow('Platform', d.platform);
+    document.getElementById('info-conn').innerHTML = infoRow('Serial Port', d.port) +
+      infoRow('Baud Rate', d.baud) +
+      infoRow('Protocol', d.protocol) +
+      infoRow('CAN Status', d.can_status) +
+      infoRow('Data Source', d.can_connected ? 'CAN Adapter (0xA5)' : 'IMU Sensor (0x8E)') +
+      infoRow('Frame Rate', d.fps + ' fps');
+  }
 
-  // Dashboard waveform
-  drawDashWaveform(d.can_history || []);
-
-  // Live data tab
-  updateLiveData(d);
-
-  // Raw hex tab
-  if (!rawPaused) updateRawHex(d.raw_frames || []);
-
-  // Graphs
-  drawGraphs(d.can_history || []);
-
-  // Frame distribution
-  updateFrameDist(d.frame_counts);
-
-  // Vehicle info
-  updateVehicleInfo(d);
-
-  // System log
-  updateSysLog(d.scan_log || []);
-
-  // Data log
-  updateDataLog(d);
+  // Frame count badges
+  document.getElementById('raw-imu').textContent = 'IMU: ' + d.frame_counts.imu;
+  document.getElementById('raw-hb').textContent = 'HB: ' + d.frame_counts.heartbeat;
+  document.getElementById('raw-can').textContent = 'CAN: ' + d.frame_counts.can;
 }
 
-function drawDashWaveform(hist) {
-  const c = document.getElementById('dash-canvas');
-  if (!c) return;
-  const ctx = c.getContext('2d');
-  c.width = c.offsetWidth;
-  const W = c.width, H = c.height;
-  ctx.fillStyle = '#0a0a12';
-  ctx.fillRect(0, 0, W, H);
+function infoRow(label, value) {
+  return `<div class="label">${label}</div><div class="val">${value}</div>`;
+}
 
-  if (hist.length < 2) { ctx.fillStyle='#333'; ctx.fillText('Waiting for data...', W/2-50, H/2); return; }
+async function updateRaw() {
+  try {
+    const res = await fetch('/api/raw');
+    const frames = await res.json();
+    const box = document.getElementById('raw-box');
+    let html = '';
+    for (const f of frames.slice(-50)) {
+      const typeColor = f.type === 'IMU/3D' ? '#f0883e' : f.type === 'CAN' ? '#3fb950' : '#58a6ff';
+      html += `<div class="raw-line"><span class="ts">${f.time}</span> <span class="type" style="color:${typeColor}">[${f.type}]</span> ${f.hex}</div>`;
+    }
+    box.innerHTML = html;
+    box.scrollTop = box.scrollHeight;
+    document.getElementById('raw-count').textContent = frames.length + ' frames';
+  } catch(e) {}
+}
 
-  // Draw grid
-  ctx.strokeStyle = '#1a1a2a';
-  ctx.lineWidth = 0.5;
-  for (let y = 0; y < H; y += 20) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+async function updateGraphs() {
+  try {
+    const res = await fetch('/api/imu_graph');
+    const data = await res.json();
+    drawGraph('imu-canvas', data, ['x','y','z'], ['#f0883e','#3fb950','#58a6ff'], 0, 15);
+    drawGraph('baseline-canvas', data, ['b3','b5'], ['#d2a8ff','#d29922'], 0, 255);
+  } catch(e) {}
+}
 
-  const n = Math.min(hist.length, 120);
-  const data = hist.slice(-n);
-  const dx = W / (n - 1);
+function drawGraph(canvasId, data, keys, colors, ymin, ymax) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || !data.length) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width = canvas.offsetWidth * 2;
+  const h = canvas.height = 400;
+  ctx.clearRect(0, 0, w, h);
 
-  // B3 signal (green)
-  drawLine(ctx, data, 'b3', 0, 255, '#00ff88', dx, H);
-  // B5 signal (blue)
-  drawLine(ctx, data, 'b5', 0, 255, '#00ccff', dx, H);
-  // B2h nibble (orange, scaled)
-  drawLine(ctx, data, 'b2h', 0, 15, '#ff8800', dx, H);
+  // Grid
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = (h * i) / 4;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    ctx.fillStyle = '#6e7681';
+    ctx.font = '20px monospace';
+    ctx.fillText(Math.round(ymax - (ymax-ymin)*i/4), 4, y + 16);
+  }
+
+  // Data lines
+  const n = data.length;
+  keys.forEach((key, ki) => {
+    ctx.strokeStyle = colors[ki];
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * w;
+      const val = data[i][key] || 0;
+      const y = h - ((val - ymin) / (ymax - ymin)) * h;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  });
 
   // Legend
-  ctx.font = '10px sans-serif';
-  ctx.fillStyle = '#00ff88'; ctx.fillText('B3', 5, 12);
-  ctx.fillStyle = '#00ccff'; ctx.fillText('B5', 30, 12);
-  ctx.fillStyle = '#ff8800'; ctx.fillText('B2h', 55, 12);
-}
-
-function drawLine(ctx, data, key, min, max, color, dx, H) {
-  ctx.beginPath();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.5;
-  for (let i = 0; i < data.length; i++) {
-    const v = data[i][key];
-    if (v === undefined) continue;
-    const y = H - ((v - min) / (max - min)) * (H - 20) - 10;
-    if (i === 0) ctx.moveTo(0, y);
-    else ctx.lineTo(i * dx, y);
-  }
-  ctx.stroke();
-}
-
-function updateLiveData(d) {
-  const el = document.getElementById('live-groups');
-  if (!el) return;
-  const groups = d.can_groups || {};
-  const keys = Object.keys(groups).sort();
-  if (keys.length === 0) { el.innerHTML = '<div style="padding:10px;color:var(--dim)">Waiting for CAN data...</div>'; return; }
-
-  let html = '<table style="width:100%;font-size:11px;font-family:monospace;border-collapse:collapse">';
-  html += '<tr style="color:var(--dim)"><th style="text-align:left;padding:4px">Type</th><th>Count</th><th>Last B2-B6</th><th>Rate</th></tr>';
-  for (const k of keys) {
-    const g = groups[k];
-    const s = g.samples && g.samples.length > 0 ? g.samples[g.samples.length-1] : null;
-    const lastData = s ? `${s.b2.toString(16).padStart(2,'0')} ${s.b3.toString(16).padStart(2,'0')} ${s.b4.toString(16).padStart(2,'0')} ${s.b5.toString(16).padStart(2,'0')} ${s.b6.toString(16).padStart(2,'0')}`.toUpperCase() : '--';
-    const ago = g.last ? Math.round((Date.now()/1000 - g.last)*10)/10 : '--';
-    html += `<tr style="border-top:1px solid #1a1a2a"><td style="padding:4px;color:var(--accent2)">${k}</td><td style="text-align:center">${g.count}</td><td style="color:var(--text)">${lastData}</td><td style="text-align:center;color:var(--dim)">${ago}s ago</td></tr>`;
-  }
-  html += '</table>';
-  el.innerHTML = html;
-
-  // Byte ranges
-  const hist = d.can_history || [];
-  if (hist.length > 0) {
-    const last20 = hist.slice(-20);
-    const r = (arr, k) => { const vs = arr.map(x=>x[k]).filter(v=>v!==undefined); return vs.length ? (Math.min(...vs).toString(16)+'-'+Math.max(...vs).toString(16)).toUpperCase() : '--'; };
-    document.getElementById('lb2r').textContent = r(last20,'b2h');
-    document.getElementById('lb3r').textContent = r(last20,'b3');
-    document.getElementById('lb5r').textContent = r(last20,'b5');
-    document.getElementById('lb4r').textContent = r(last20,'b4h');
-    document.getElementById('lb6r').textContent = r(last20,'b6h');
-    document.getElementById('lgrp').textContent = keys.length;
-  }
-}
-
-function updateRawHex(frames) {
-  const el = document.getElementById('raw-hex');
-  if (!el) return;
-  const last = frames.slice(-50).reverse();
-  document.getElementById('raw-count').textContent = frames.length + ' frames';
-  let html = '';
-  for (const f of last) {
-    html += `<div class="hex-line"><span class="hex-type hex-type-${f.type}">${f.type}</span> ${f.hex}</div>`;
-  }
-  el.innerHTML = html || '<div style="padding:10px;color:var(--dim)">No frames yet</div>';
-}
-
-function toggleRawPause() {
-  rawPaused = !rawPaused;
-  document.getElementById('raw-pause-btn').textContent = rawPaused ? 'Resume' : 'Pause';
-  document.getElementById('raw-pause-btn').className = rawPaused ? 'btn btn-sm btn-accent' : 'btn btn-sm';
-}
-
-function clearRaw() { fetch('/api/cmd?action=clear_raw'); }
-
-function drawGraphs(hist) {
-  if (hist.length < 2) return;
-  const n = Math.min(hist.length, 120);
-  const data = hist.slice(-n);
-
-  // B3 graph
-  drawTimeGraph('graph-b3', data, [{key:'b3', color:'#00ff88', label:'B3', min:0, max:255}]);
-  // B5 graph
-  drawTimeGraph('graph-b5', data, [{key:'b5', color:'#00ccff', label:'B5', min:0, max:255}]);
-  // Nibbles overlay
-  drawTimeGraph('graph-nibbles', data, [
-    {key:'b2h', color:'#ff8800', label:'B2h', min:0, max:15},
-    {key:'b4h', color:'#00ff88', label:'B4h', min:0, max:15},
-    {key:'b6h', color:'#00ccff', label:'B6h', min:0, max:15},
-  ]);
-  // B7 distribution
-  drawB7Dist('graph-b7', data);
-}
-
-function drawTimeGraph(id, data, series) {
-  const c = document.getElementById(id);
-  if (!c) return;
-  const ctx = c.getContext('2d');
-  c.width = c.offsetWidth;
-  const W = c.width, H = c.height;
-  ctx.fillStyle = '#0a0a12';
-  ctx.fillRect(0, 0, W, H);
-  // Grid
-  ctx.strokeStyle = '#1a1a2a'; ctx.lineWidth = 0.5;
-  for (let y = 0; y < H; y += 30) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
-  const dx = W / (data.length - 1);
-  // Series
-  let lx = 5;
-  for (const s of series) {
-    drawLine(ctx, data, s.key, s.min, s.max, s.color, dx, H);
-    ctx.font = '10px sans-serif';
-    ctx.fillStyle = s.color;
-    ctx.fillText(s.label, lx, 12);
-    lx += ctx.measureText(s.label).width + 10;
-  }
-  // Y-axis labels
-  ctx.font = '9px monospace'; ctx.fillStyle = '#444';
-  if (series.length === 1) {
-    ctx.fillText(series[0].max, W-25, 12);
-    ctx.fillText(series[0].min, W-15, H-4);
-  }
-}
-
-function drawB7Dist(id, data) {
-  const c = document.getElementById(id);
-  if (!c) return;
-  const ctx = c.getContext('2d');
-  c.width = c.offsetWidth;
-  const W = c.width, H = c.height;
-  ctx.fillStyle = '#0a0a12';
-  ctx.fillRect(0, 0, W, H);
-  // Count B7 values
-  const counts = {};
-  for (const d of data) { const k = '0x'+(d.b7||0).toString(16).toUpperCase().padStart(2,'0'); counts[k] = (counts[k]||0)+1; }
-  const keys = Object.keys(counts).sort();
-  if (keys.length === 0) return;
-  const max = Math.max(...Object.values(counts));
-  const bw = Math.min(60, (W-20) / keys.length - 4);
-  const colors = ['#00ff88','#00ccff','#ff8800','#ffcc00','#ff3355','#aa66ff','#66ffaa','#ff66aa'];
-  let x = 20;
-  for (let i = 0; i < keys.length; i++) {
-    const h = (counts[keys[i]] / max) * (H - 30);
-    ctx.fillStyle = colors[i % colors.length];
-    ctx.fillRect(x, H - h - 15, bw, h);
-    ctx.font = '9px monospace'; ctx.fillStyle = '#888';
-    ctx.fillText(keys[i], x, H - 2);
-    ctx.fillStyle = colors[i % colors.length];
-    ctx.fillText(counts[keys[i]], x, H - h - 18);
-    x += bw + 4;
-  }
-}
-
-function updateFrameDist(fc) {
-  const el = document.getElementById('frame-dist');
-  if (!el) return;
-  const total = Object.values(fc).reduce((a,b)=>a+b, 0) || 1;
-  let html = '';
-  const colors = {sensor:'var(--accent2)',heartbeat:'var(--green)',status:'var(--yellow)',other:'var(--dim)'};
-  for (const [k,v] of Object.entries(fc)) {
-    const pct = (v/total*100).toFixed(1);
-    html += `<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px">
-      <span style="width:70px;color:${colors[k]||'var(--dim)'}">${k}</span>
-      <div style="flex:1;height:14px;background:#111;border-radius:2px;overflow:hidden">
-        <div style="width:${pct}%;height:100%;background:${colors[k]||'#333'}"></div>
-      </div>
-      <span style="width:60px;text-align:right;color:var(--dim)">${v} (${pct}%)</span>
-    </div>`;
-  }
-  el.innerHTML = html;
-}
-
-function updateVehicleInfo(d) {
-  const el = document.getElementById('vehicle-info');
-  if (!el) return;
-  const fields = [
-    ['Vehicle', d.vehicle], ['VIN', d.vin], ['Protocol', d.protocol],
-    ['CAN Profile', d.canbus_profile], ['Serial Port', d.port],
-    ['Baud Rate', d.baud], ['Head Unit', d.head_unit],
-    ['Platform', d.platform], ['Firmware', d.firmware],
-    ['MCU ID', d.mcu_id], ['Heartbeats', d.heartbeat_count],
-    ['MIL Status', d.mil ? 'ON' : 'OFF'], ['DTC Count', d.dtc_count],
-  ];
-  let html = '';
-  for (const [l,v] of fields) {
-    html += `<div class="info-row"><div class="info-label">${l}</div><div class="info-value">${v}</div></div>`;
-  }
-  el.innerHTML = html;
-}
-
-function updateSysLog(logs) {
-  const el = document.getElementById('sys-log');
-  if (!el) return;
-  const last = logs.slice(-100);
-  el.innerHTML = last.map(l => `<div class="log-line">${l}</div>`).join('');
-  el.scrollTop = el.scrollHeight;
-}
-
-function updateDataLog(d) {
-  const el = document.getElementById('log-data');
-  if (!el) return;
-  const logBtn = document.getElementById('log-toggle-btn');
-  const logStatus = document.getElementById('log-status');
-  if (d.logging_active) {
-    logBtn.textContent = 'Stop Logging';
-    logBtn.className = 'btn btn-red';
-    logStatus.textContent = 'Logging: ON (' + (d.data_log||[]).length + ' entries)';
-    logStatus.style.color = 'var(--green)';
-  } else {
-    logBtn.textContent = 'Start Logging';
-    logBtn.className = 'btn btn-accent';
-    logStatus.textContent = 'Logging: OFF';
-    logStatus.style.color = 'var(--dim)';
-  }
-  const log = d.data_log || [];
-  const last = log.slice(-50);
-  el.innerHTML = 'Timestamp,B2,B3,B4,B5,B6,B7\n' + last.join('\n');
-  el.scrollTop = el.scrollHeight;
-}
-
-// API calls
-function fetchState() {
-  fetch('/api/state').then(r=>r.json()).then(d=>updateUI(d)).catch(()=>{});
-}
-
-function scanDTCs() {
-  document.getElementById('dtc-status').innerHTML = '<div class="ind ind-info">Scanning...</div>';
-  fetch('/api/cmd?action=scan_dtcs').then(r=>r.json()).then(d => {
-    document.getElementById('dtc-status').innerHTML = '<div class="ind ind-ok">Scan complete</div>';
+  keys.forEach((key, ki) => {
+    ctx.fillStyle = colors[ki];
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText(key.toUpperCase(), w - 200 + ki * 60, 30);
   });
 }
 
-function clearDTCs() {
-  if (confirm('Clear all stored DTCs? This will turn off the check engine light.')) {
-    fetch('/api/cmd?action=clear_dtcs').then(r=>r.json());
-  }
+async function updateLogPanel() {
+  const st = document.getElementById('log-status');
+  try {
+    const res = await fetch('/api/state');
+    const d = await res.json();
+    if (d.log_active) {
+      st.textContent = 'Recording... ' + d.log_records + ' records';
+      document.getElementById('btn-log-start').style.display = 'none';
+      document.getElementById('btn-log-stop').style.display = 'inline-block';
+    } else {
+      st.textContent = d.log_records > 0 ? d.log_records + ' records captured' : '';
+      document.getElementById('btn-log-start').style.display = 'inline-block';
+      document.getElementById('btn-log-stop').style.display = 'none';
+    }
+  } catch(e) {}
 }
 
-function sendRawCmd() {
-  const cmd = document.getElementById('raw-cmd').value.trim();
-  if (!cmd) return;
-  fetch('/api/cmd?action=raw_send&data=' + encodeURIComponent(cmd)).then(r=>r.json()).then(d => {
-    const el = document.getElementById('cmd-response');
-    const resp = d.response || [];
-    el.innerHTML = resp.length > 0
-      ? resp.map(r => `<div class="hex-line">${r}</div>`).join('')
-      : '<div style="padding:6px;color:var(--dim)">No response (MCU may not respond without CAN handshake)</div>';
-  });
-}
+async function startLog() { await fetch('/api/start_log'); }
+async function stopLog() { await fetch('/api/stop_log'); }
+function downloadLog() { window.open('/api/download_log'); }
 
-function sendQuick(cmd) {
-  document.getElementById('raw-cmd').value = cmd;
-  sendRawCmd();
-}
-
-function toggleLogging() {
-  fetch('/api/cmd?action=toggle_logging').then(r=>r.json());
-}
-
-function downloadLog() {
-  fetch('/api/log_csv').then(r=>r.text()).then(csv => {
-    const blob = new Blob([csv], {type:'text/csv'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'obd2_log_' + new Date().toISOString().slice(0,19).replace(/:/g,'') + '.csv';
-    a.click();
-  });
-}
-
-function clearLog() { fetch('/api/cmd?action=clear_log'); }
-
-// Start polling
-updateTimer = setInterval(fetchState, 500);
-fetchState();
+poll();
 </script>
 </body>
 </html>"""
 
-
-# ── HTTP Server ──
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # Suppress default logging
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path == "/" or path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(HTML_PAGE.encode())
-
-        elif path == "/api/state":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            # Build safe response (avoid sending huge sample arrays)
-            resp = dict(state)
-            groups = {}
-            for k, v in state["can_groups"].items():
-                last_sample = v["samples"][-1] if v["samples"] else None
-                groups[k] = {"count": v["count"], "last": v["last"], "samples": [last_sample] if last_sample else []}
-            resp["can_groups"] = groups
-            resp["can_history"] = state["can_history"][-120:]
-            resp["data_log"] = state["data_log"][-100:]
-            resp["raw_frames"] = state["raw_frames"][-50:]
-            resp["scan_log"] = state["scan_log"][-100:]
-            self.wfile.write(json.dumps(resp, default=str).encode())
-
-        elif path == "/api/cmd":
-            params = parse_qs(parsed.query)
-            action = params.get("action", [""])[0]
-            result = {"ok": True}
-
-            if action == "scan_dtcs":
-                threading.Thread(target=cmd_scan_dtcs, daemon=True).start()
-            elif action == "clear_dtcs":
-                threading.Thread(target=cmd_clear_dtcs, daemon=True).start()
-            elif action == "raw_send":
-                data = params.get("data", [""])[0]
-                resp = cmd_raw_send(data)
-                result["response"] = resp
-            elif action == "toggle_logging":
-                state["logging_active"] = not state["logging_active"]
-                log(f"Data logging {'started' if state['logging_active'] else 'stopped'}")
-            elif action == "clear_log":
-                state["data_log"] = []
-                log("Data log cleared")
-            elif action == "clear_raw":
-                state["raw_frames"] = []
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
-
-        elif path == "/api/log_csv":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/csv")
-            self.send_header("Content-Disposition", "attachment; filename=obd2_log.csv")
-            self.end_headers()
-            csv = "Timestamp,B2,B3,B4,B5,B6,B7\n"
-            csv += "\n".join(state["data_log"])
-            self.wfile.write(csv.encode())
-
-        else:
-            self.send_response(404)
-            self.end_headers()
-
 # ── Main ──
+if __name__ == "__main__":
+    add_log("OBD2 Pro Tuner v3.0 starting...")
+    add_log(f"Serial: {SERIAL_PORT} @ {BAUD_RATE}")
+    add_log("Protocol: CRLF-delimited MCU frames")
+    add_log("Monitoring for: 0x8E (IMU), 0x71 (Heartbeat), 0xA5 (CAN)")
 
-def main():
-    global running
+    reader = threading.Thread(target=background_reader, daemon=True)
+    reader.start()
 
-    print(f"\n  OBD2 Pro Tuner v2.0")
-    print(f"  Serial: {SERIAL_PORT} @ {BAUD_RATE}")
-    print(f"  Web UI: http://localhost:{PORT}")
-    print(f"  Press Ctrl+C to stop\n")
-
-    open_serial()
-
-    reader_thread = threading.Thread(target=background_reader, daemon=True)
-    reader_thread.start()
-
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
-    server.socket.settimeout(1)
-
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    add_log(f"Dashboard: http://localhost:{PORT}")
+    print(f"OBD2 Pro Tuner v3.0 running on port {PORT}")
     try:
-        while running:
-            server.handle_request()
+        server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down...")
-    finally:
-        running = False
-        close_serial()
-        server.server_close()
-
-if __name__ == "__main__":
-    main()
+        server.shutdown()

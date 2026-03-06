@@ -33,6 +33,7 @@ javac --release 8 \
     -classpath $ANDROID_JAR \
     -d $OBJ \
     $GEN/com/mobilecli/obd2/R.java \
+    $SRC/java/com/mobilecli/obd2/BluetoothOBD2.java \
     $SRC/java/com/mobilecli/obd2/OBD2Scanner.java
 
 # Step 4: Convert to DEX
